@@ -184,6 +184,101 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(pool.submit.call_count, 2)
         self.assertIs(pool.submit.call_args.args[0], worker.idle_mercury)
 
+    def test_records_carry_submit_path_sequence_and_stage_times(self):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+        from handtrack.merctrack import MercuryTracker, HandState
+
+        pool, done = Mock(), Future()
+        pool.submit.return_value = done
+        palm = SimpleNamespace(pose={0: (np.eye(3), np.zeros(3)), 1: (np.eye(3), np.zeros(3))})
+        tracker = MercuryTracker(palm, pool, Mock())
+        joints = np.random.default_rng(3).normal(0, .01, (21, 3)) + [0, 0, .5]
+        tracker.hands["left"] = HandState("left", joints, 1.0)
+        info = {"path": "early", "seq": 41, "t_read": 5, "t_ready": 7}
+        self.assertTrue(tracker.submit({0: np.zeros(1), 1: np.zeros(1)}, 10**9, {}, info=info))
+        done.set_result([(1, "left", None, 0.01, {})])
+        tracker.collect()
+        rec = tracker.records[0]
+        self.assertEqual((rec["path"], rec["seq"], rec["t_read"], rec["t_ready"]), ("early", 41, 5, 7))
+        self.assertEqual(tracker.job_info, {})
+
+
+class AdmissionTests(unittest.TestCase):
+    PERIOD = 1 / 60
+
+    def test_a_capture_is_submitted_at_most_once(self):
+        from handtrack.mercsched import Admission
+        adm = Admission()
+        self.assertFalse(adm.admissible(0.0, self.PERIOD, False))          # no frame yet
+        adm.frame(1, 0.0)
+        self.assertTrue(adm.admissible(0.001, self.PERIOD, False))
+        adm.submitted(0.001)
+        for between in (False, True):
+            self.assertFalse(adm.admissible(0.002, self.PERIOD, between))
+        adm.frame(2, 0.017)
+        self.assertTrue(adm.admissible(0.018, self.PERIOD, True))
+
+    def test_stalled_cameras_stop_admission_and_resume_on_a_new_frame(self):
+        from handtrack.mercsched import Admission, STALL_S
+        adm = Admission()
+        adm.frame(1, 0.0)
+        self.assertFalse(adm.stalled(STALL_S))
+        self.assertTrue(adm.stalled(STALL_S + 0.001))
+        self.assertFalse(adm.admissible(STALL_S + 0.001, self.PERIOD, False))
+        adm.frame(2, 5.0)
+        self.assertTrue(adm.admissible(5.001, self.PERIOD, False))
+
+    def test_fresh_submits_between_frames_only_within_a_third_of_a_period(self):
+        from handtrack.mercsched import Admission
+        fresh, legacy = Admission(fresh=True), Admission()
+        for adm in (fresh, legacy):
+            adm.frame(1, 1.0)
+        self.assertTrue(fresh.admissible(1.005, self.PERIOD, True))
+        self.assertFalse(fresh.admissible(1.006, self.PERIOD, True))       # wait for the next frame
+        self.assertTrue(fresh.admissible(1.012, self.PERIOD, False))       # the frame path is unaffected
+        self.assertTrue(legacy.admissible(1.012, self.PERIOD, True))       # --merc-early behaviour kept
+
+    def test_power_is_released_once_after_the_grace_period_not_per_gap(self):
+        from handtrack.mercsched import Admission, IDLE_S
+        adm = Admission()
+        self.assertFalse(adm.should_release(10.0, False))                  # nothing ever held
+        self.assertFalse(adm.should_release(0.0, True))                    # in flight counts as active
+        self.assertFalse(adm.should_release(IDLE_S * 0.9, False))          # short gap keeps power
+        adm.active(IDLE_S * 0.9)
+        self.assertFalse(adm.should_release(IDLE_S * 1.5, False))
+        self.assertTrue(adm.should_release(IDLE_S * 2, False))
+        self.assertFalse(adm.should_release(IDLE_S * 3, False))            # once per idle period
+        adm.submitted(5.0)
+        self.assertTrue(adm.should_release(5.0 + IDLE_S, False))           # resume, then idle again
+
+    def test_frozen_cameras_release_power_without_reinferring_the_last_frame(self):
+        """Simulated 60 Hz capture that freezes: the coordinator's admit/power sequence."""
+        from handtrack.mercsched import Admission, IDLE_S, STALL_S
+        adm, submits, releases, busy_until = Admission(), [], [], -1.0
+        t, seq = 0.0, 0
+        while t < 1.0:
+            if t < 0.3 and t >= seq * self.PERIOD:                         # cameras freeze at 0.3 s
+                seq += 1
+                adm.frame(seq, t)
+            busy = t < busy_until
+            if busy:
+                adm.active(t)
+            elif not adm.stalled(t):
+                if adm.admissible(t, self.PERIOD, True):
+                    submits.append(adm.seq)
+                    adm.submitted(t)
+                    busy_until = t + 0.028
+                else:
+                    adm.active(t)
+            if adm.should_release(t, t < busy_until):
+                releases.append(t)
+            t += 0.002
+        self.assertEqual(len(submits), len(set(submits)))
+        self.assertEqual(len(releases), 1)
+        self.assertGreater(releases[0], 0.3 + STALL_S)
+        self.assertLess(releases[0], 0.3 + STALL_S + IDLE_S + 0.01)
+
 
 @unittest.skipUnless(os.environ.get("FNPU_MERCURY_MODEL"), "pinned local model required")
 class GeometryParityTests(unittest.TestCase):

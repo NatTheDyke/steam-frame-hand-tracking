@@ -80,9 +80,25 @@ inference error switches this worker to CPU. It reruns the complete affected
 batch on CPU, preserving order. It logs the failure once and never retries or
 reopens the accelerator during that worker's lifetime.
 
-HMX power is held between tracking requests and released when the tracker has
-no observations or the thermal guard pauses inference. A later observation
-resumes the same session. Shutdown waits for the active job, releases power,
+HMX power is held between tracking requests. `handtrack/mercsched.py` releases
+it once admission has been blocked for 0.2 s: no tracked hand, all hands
+disabled, the thermal guard pausing inference, no placeable crop, or camera
+pairs stalled for 0.1 s (headset standby, capture stopped). Rate-cap gaps and
+waiting for the next frame keep power, so it is never cycled per crop. Each
+capture is submitted at most once, so a frozen camera image is never
+re-inferred. A later fresh capture resumes the same session; telemetry `Z` rows
+record each release and its reason.
+
+`--merc-fresh` (off by default) submits each frame right after optical flow,
+before MediaPipe result handling, and collects finished jobs between camera frames.
+It then submits the newest frame only if it became ready less than a third of
+a frame period ago, otherwise it waits for the next frame, which minimises the
+mean age of the newest result while the worker is the bottleneck. R telemetry
+columns 21..24 record the submit path, capture sequence and the pair's read and
+optical-flow-done times; FrameNPU's `tools/mercury_live_report.py` turns them
+into per-stage request ages.
+
+Shutdown waits for the active job, releases power,
 retires the image and restores the borrowed arena. The worker also registers a
 multiprocessing finalizer. The stop script lets the parent perform that cleanup
 before terminating leftover worker processes.

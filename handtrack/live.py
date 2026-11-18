@@ -49,6 +49,7 @@ cv2.setNumThreads(1)
 from handtrack.calib import triangulate
 from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
+from handtrack.mercsched import Admission
 from handtrack.palm import PALM_IDX, Bridge, OneEuro, PalmTracker
 
 SHM = "/dev/shm/mrhand-pt"
@@ -180,6 +181,9 @@ class Telemetry:
       *_age_ms: t_send minus the capture time of the image the component was measured on
     M rows (one per camera per MediaPipe run):
       M,t_det_ns,t_done_ns,kind,slot,dur_ms,nhands
+    Z rows (held Mercury inference power released after admission was blocked, see mercsched.py):
+      Z,t_ns,reason   reason: stall (no new camera pair) | untracked (no tracked or enabled hand) |
+                      thermal (thermal guard paused Mercury) | unplaceable (no crop in front of a camera)
     """
 
     def __init__(self, path, max_bytes=20_000_000):
@@ -339,6 +343,10 @@ def main():
                          "camera and with the current position (prevents short depth jumps)")
     ap.add_argument("--merc-early", action="store_true",
                     help="collect finished Mercury jobs and submit the next one between camera frames")
+    ap.add_argument("--merc-fresh", action="store_true",
+                    help="submit Mercury right after optical flow (before MediaPipe handling); collect finished jobs "
+                         "between camera frames and submit then only if the newest frame became ready less than a "
+                         "third of a frame period ago, else wait for the next frame")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
                     help="batch: all tracked hands in one Mercury job, published together (original); "
                          "perhand: one hand per job on the newest frame, published as soon as it is done")
@@ -523,9 +531,23 @@ def main():
         k = 0
         frame_no = 0
         last_hand = 0.0
-        def merc_service():
-            """Mercury continuous tracking: collect a finished job, then submit the next one on the
-            newest frame (imgs / t_cap / fast_pos of the last processed camera frame)."""
+        adm = Admission(fresh=a.merc_fresh)  # capture admission + held-power release (handtrack/mercsched.py)
+        frame_t = {}                         # stage times of the newest processed pair (monotonic ns)
+        blocked = ["untracked"]              # why merc_admit last refused to submit (logged with a release)
+        def merc_service(between_frames=False, path=None):
+            merc_collect()
+            merc_admit(between_frames, path)
+            merc_power()
+
+        def merc_power():
+            """Release held inference power once admission has been blocked for a while."""
+            if mt is not None and adm.should_release(time.monotonic(), mt.busy()):
+                mt.idle()
+                if tel is not None:
+                    tel.write("Z,%d,%s" % (time.monotonic_ns(), "stall" if adm.stalled(time.monotonic()) else blocked[0]))
+
+        def merc_collect():
+            """Mercury continuous tracking: collect a finished job and publish its observations."""
             nonlocal next_merc, next_det, last_hand
             if mt is not None:
                 for side, (pose_m, sl_m, px_m, t_m, img_m) in mt.collect().items():
@@ -548,9 +570,12 @@ def main():
                     # thread CPU vs runqueue wait, hands in the job, outcome, raw (unfiltered) orientation
                     for rc in mt.records:
                         q_ = rc["rq"] if rc["rq"] is not None else (0, 0, 0, 0)
-                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f,%d,%s,%d,%.3f" % (
+                        # columns 21..24 (zero-based): submit path (frame | early), capture sequence, and the
+                        # pair's read / flow-done times (ns): stage ages t_read-t_cap, t_ready-t_read, t_sub-t_ready
+                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f,%d,%s,%d,%.3f,%s,%d,%d,%d" % (
                             rc["id"], rc["side"], rc["slot"], rc["t_cap"], rc["t_sub"], rc["t0"], rc["t1"], rc["t_col"],
-                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_, rc["hint"], rc["inference"], rc["request_crops"], rc["dsp_body_ms"]))
+                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_, rc["hint"], rc["inference"], rc["request_crops"], rc["dsp_body_ms"],
+                            rc["path"], rc["seq"], rc["t_read"], rc["t_ready"]))
                 mt.records.clear()
                 if mt.collapsed:
                     # both trackers ended up on one physical hand: forget the dropped one everywhere and
@@ -561,21 +586,44 @@ def main():
                     next_det = 0.0
                     if tel is not None:
                         tel.write("C,%d,%s" % (t_cap, mt.collapsed))
-                if not mt.busy() and not mt.tracked():
-                    mt.idle()
-                if not mt.busy() and time.monotonic() >= next_merc:
-                    # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
-                    n_ = max(1, len(mt.hands)) if a.merc_sched == "perhand" else 1
-                    iv = thermal.interval(a.merc_hz * n_)
-                    # v2: Mercury anchors single-view depth only to a two-camera position, never to a held
-                    # single-camera depth (that error would otherwise propagate into the joints); the crop is
-                    # still placed with every fast position (its image location is right)
-                    fp_ = {sd: v for sd, v in fast_pos.items()
-                           if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
-                    if iv is not None and mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_):
-                        next_merc = time.monotonic() + iv
-                    else:
-                        mt.idle()
+
+        def merc_admit(between_frames, path=None):
+            """Submit the next job on the newest processed frame (imgs / t_cap / fast_pos) if admitted.
+            Blocked admission (no tracked hand, stalled cameras, thermal pause, no placeable crop) is
+            not marked active, so merc_power() releases held power after the grace period."""
+            nonlocal next_merc
+            if mt is None:
+                return
+            now = time.monotonic()
+            if mt.busy():
+                adm.active(now)
+                return
+            if not mt.tracked() or adm.stalled(now):
+                blocked[0] = "untracked" if not mt.tracked() else "stall"
+                return
+            if now < next_merc:
+                adm.active(now)                     # rate cap: still tracking
+                return
+            # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
+            n_ = max(1, len(mt.hands)) if a.merc_sched == "perhand" else 1
+            iv = thermal.interval(a.merc_hz * n_)
+            if iv is None:
+                blocked[0] = "thermal"
+                return
+            if not adm.admissible(now, grid_period / 1e9, between_frames):
+                adm.active(now)                     # this capture was used (or is stale): next frame
+                return
+            # v2: Mercury anchors single-view depth only to a two-camera position, never to a held
+            # single-camera depth (that error would otherwise propagate into the joints); the crop is
+            # still placed with every fast position (its image location is right)
+            fp_ = {sd: v for sd, v in fast_pos.items()
+                   if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
+            info = dict(frame_t, path=path or ("early" if between_frames else "frame"), seq=adm.seq)
+            if mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_, info=info):
+                adm.submitted(now)
+                next_merc = now + iv
+            else:
+                blocked[0] = "unplaceable"          # no crop in front of either camera
 
 
         hands_cfg = EnabledHands()
@@ -615,10 +663,16 @@ def main():
                 bridge.enabled_mask = (1 if "left" in enabled else 0) | (2 if "right" in enabled else 0)
             r0, r1 = shm.read(0, last[0]), shm.read(1, last[1])
             if not r0 or not r1:
-                # --merc-early: between camera frames, collect a finished Mercury job and start the next
-                # one right away instead of waiting up to a frame for the next loop pass
-                if a.merc_early and have_frame and mt is not None and mt.job is not None and mt.job[0].done():
-                    merc_service()
+                if have_frame and mt is not None:
+                    # --merc-early / --merc-fresh: between camera frames, collect a finished Mercury job and
+                    # (if admitted) start the next one instead of waiting up to a frame for the next loop pass.
+                    # On stalled cameras a finished job is always collected so held power can be released.
+                    early = a.merc_early or a.merc_fresh
+                    if mt.job is not None and mt.job[0].done() and (early or adm.stalled(time.monotonic())):
+                        merc_collect()
+                        if early:
+                            merc_admit(True)
+                    merc_power()
                 time.sleep(0.002)
                 continue
             if abs(r0[1] - r1[1]) > 8e6:          # not the same capture: wait for the lagging camera
@@ -628,6 +682,7 @@ def main():
                     last[1] = r1[0]
                 continue
             last[0], last[1] = r0[0], r1[0]
+            frame_t = {"t_read": time.monotonic_ns()}
             frame_no += 1
             have_frame = True
             t_raw = min(r0[1], r1[1])
@@ -650,6 +705,11 @@ def main():
             fast_pos = {} if skip_frame else fast.step(imgs, t_s)
             v2_report()
             fast_ms = (time.perf_counter() - tf) * 1e3
+            frame_t["t_ready"] = time.monotonic_ns()
+            adm.frame(frame_no, frame_t["t_ready"] / 1e9)
+            if a.merc_fresh:
+                # submit on this frame as soon as its flow positions exist, before MediaPipe handling
+                merc_service()
 
             # ---- slow path: collect a finished MediaPipe run, re-seed the tracker
             if job and job[0].done():
@@ -789,7 +849,9 @@ def main():
                                                                   float(np.median(e3[[0, 5, 9, 13, 17]])),
                                                                   float(np.median(gap)) * 100))
 
-            merc_service()
+            # --merc-fresh: a second chance later in the frame (a job that just finished, or a hand MediaPipe
+            # just seeded), admitted like a between-frames submit because this frame has aged meanwhile
+            merc_service(between_frames=a.merc_fresh, path="late" if a.merc_fresh else None)
 
             # ---- schedule the next MediaPipe run (rate cap, thermal guard, idle mode)
             now_m = time.monotonic()
