@@ -111,13 +111,11 @@ def make_instructions(joints_m, flip, expand=EXPAND, twist=0.0):
 
 # ---------------------------------------------------------------- model wrapper
 class MercuryKeypoint:
-    def __init__(self, model_path, rig, slot_cams, det_size, raw_size=2464, threads=1):
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
-        so.inter_op_num_threads = 1
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.sess = ort.InferenceSession(model_path, so, providers=["CPUExecutionProvider"])
+    def __init__(self, model_path, rig, slot_cams, det_size, raw_size=2464, threads=1,
+                 backend=None, inference="cpu", framenpu_jobs=None):
+        from handtrack.inference import make_backend
+        self.backend = backend if backend is not None else make_backend(
+            model_path, threads, inference, framenpu_jobs)
         self.cam = {s: rig.cams[n] for s, n in slot_cams.items()}
         self.det_size, self.raw_size = det_size, raw_size
         g = (np.arange(WSIZE, dtype=np.float32))
@@ -155,9 +153,34 @@ class MercuryKeypoint:
         return f
 
     def run(self, slot, det_img, joints_cv, flip, use_hint=True, expand=None):
-        """joints_cv: (21,3) predicted joints in this camera's OpenCV frame (metres).
-        Returns dict: rays (21,3) unit directions in the OpenCV camera frame, det_px (21,2),
-        conf (21,) heatmap peak values, rel_depth (21,), is_hand prob, curls (5,), curl_var (5,)."""
+        """One available observation: submit immediately, never wait for more crops."""
+        return self.run_many([dict(slot=slot, det_img=det_img, joints_cv=joints_cv,
+                                   flip=flip, use_hint=use_hint, expand=expand)])[0]
+
+    def run_many(self, observations):
+        """Available observations, in order; synchronous chunks of at most three.
+
+        Zero-contrast crops produce None in their original position and consume
+        no inference slot. This method owns no queue and never pads a request.
+        """
+        results = []
+        for start in range(0, len(observations), 3):
+            prepared = [self._prepare(**o) for o in observations[start:start + 3]]
+            valid = [p for p in prepared if p is not None]
+            outputs = self.backend.infer([p[-1] for p in valid]) if valid else []
+            if len(outputs) != len(valid):
+                raise ValueError("inference returned the wrong crop count")
+            it = iter(outputs)
+            results.extend(None if p is None else self._decode(p, next(it)) for p in prepared)
+        return results
+
+    def idle(self):
+        self.backend.idle()
+
+    def close(self):
+        self.backend.close()
+
+    def _prepare(self, slot, det_img, joints_cv, flip, use_hint=True, expand=None):
         jm = joints_cv * np.array([1, -1, -1])
         q, r, kp, _ = make_instructions(jm, flip, expand=EXPAND if expand is None else expand)
         img = self.crop(slot, det_img, q, r, flip)
@@ -166,7 +189,13 @@ class MercuryKeypoint:
             return None
         feeds = {"inputImg": x[None, None], "lastKeypoints": kp.reshape(1, 42) if use_hint else np.zeros((1, 42), np.float32),
                  "useLastKeypoints": np.array([1.0 if use_hint else 0.0], np.float32)}
-        hm, hd, extras, curls = self.sess.run(["heatmap_xy", "heatmap_depth", "scalar_extras", "curls"], feeds)
+        return slot, img, q, r, flip, feeds
+
+    def _decode(self, prepared, outputs):
+        # Geometry and decoding are shared by CPU and FrameNPU.
+        slot, img, q, r, flip, _ = prepared
+        hm, hd, extras, curls = (outputs[n] for n in (
+            "heatmap_xy", "heatmap_depth", "scalar_extras", "curls"))
         hm = hm[0].reshape(21, GRID * GRID)
         locs = np.zeros((21, 2))
         conf = hm.max(1)

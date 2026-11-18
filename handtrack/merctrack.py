@@ -46,6 +46,7 @@ class MercuryTracker:
         self.worker = worker                      # module with run_mercury(jobs, imgs)
         self.hands = {}                           # side -> HandState
         self.job = None
+        self.idle_future = None
         self.curl_source = "mercury"
         self.predict_roi = False
         self.stereo_ms = STEREO_MS                # max capture-time gap for triangulating two views (0 = same capture only)
@@ -81,6 +82,11 @@ class MercuryTracker:
 
     def busy(self):
         return self.job is not None
+
+    def idle(self):
+        """Queue one power release after the current observations finish."""
+        if self.job is None and self.idle_future is None:
+            self.idle_future = self.pool.submit(self.worker.idle_mercury)
 
     def submit(self, imgs, t_cap_ns, fast_pos, anchor_pos=None):
         """One Mercury crop per tracked hand on this frame (alternating cameras); in "perhand" mode
@@ -127,6 +133,7 @@ class MercuryTracker:
             jobs.append((slot, side, jc, expand, hint))
         if not jobs:
             return False
+        self.idle_future = None
         used = sorted({j[0] for j in jobs})
         self.job = (self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used}), t_cap_ns, fast_pos,
                     {s: imgs[s] for s in used}, time.monotonic_ns(), len(jobs))
@@ -155,7 +162,8 @@ class MercuryTracker:
             rec = {"id": self.next_id, "side": side, "slot": slot, "t_cap": t_ns, "t_sub": t_sub_ns,
                    "t0": tim.get("t0", 0), "t1": tim.get("t1", 0), "cpu_ns": tim.get("cpu_ns", 0),
                    "wait_ns": tim.get("wait_ns", 0), "t_col": t_col_ns, "njob": njob, "outcome": "rej", "rq": None,
-                   "hint": int(tim.get("hint", True))}
+                   "hint": int(tim.get("hint", True)), "inference": tim.get("inference", "unknown"),
+                   "request_crops": tim.get("request_crops", 0), "dsp_body_ms": tim.get("dsp_body_ms", 0.0)}
             self.next_id += 1
             self.records.append(rec)
             hs = self.hands.get(side)

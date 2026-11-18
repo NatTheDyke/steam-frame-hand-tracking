@@ -310,6 +310,10 @@ def main():
     ap.add_argument("--idle-hz", type=float, default=5.0, help="detection rate while no hand has been seen for 1 s")
     ap.add_argument("--backend", choices=("mediapipe", "mercury"), default="mediapipe",
                     help="mercury: MediaPipe only discovers hands; Mercury keypoints track them continuously")
+    ap.add_argument("--merc-inference", choices=("cpu", "framenpu"), default="cpu",
+                    help="Mercury inference (default CPU); FrameNPU failures fall back to CPU")
+    ap.add_argument("--framenpu-jobs", type=os.path.expanduser,
+                    help="qualified FrameNPU replay build directory (link.json, image and loader)")
     ap.add_argument("--curl-source", choices=("mercury", "geometric"), default="mercury",
                     help="finger curls from Mercury's curl output (default) or from the 3D joint angles")
     ap.add_argument("--merc-hz", type=float, default=30.0, help="Mercury tracking cycles per second (one crop per hand)")
@@ -349,12 +353,16 @@ def main():
                     help="rotation glides toward each new orientation with this time constant (0 = step)")
     ap.add_argument("--blend-ms", type=float, default=120.0,
                     help="ease MediaPipe re-seed corrections in over this time constant (0 = snap)")
-    ap.add_argument("--no-bridge", action="store_true", help="no stereo palm pose / UDP bridge to the PC")
+    ap.add_argument("--no-bridge", action="store_true", help="disable the UDP bridge (Mercury keeps its local palm pose)")
     ap.add_argument("--telemetry", default=os.path.expanduser("~/handtrack/data/telemetry.csv"),
                     help="per-frame telemetry CSV (rotated at 20 MB); '' disables")
     ap.add_argument("--log", help="append per-frame results as JSON lines")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (0 = run forever)")
     a = ap.parse_args()
+    if a.merc_inference == "framenpu" and not a.framenpu_jobs:
+        ap.error("--merc-inference framenpu requires --framenpu-jobs")
+    if a.merc_inference == "framenpu" and a.backend != "mercury":
+        ap.error("--merc-inference framenpu requires --backend mercury")
     import handtrack.fasttrack as _ft
     _ft.MAX_SPEED = a.max_speed
     _ft.LK["maxLevel"] = a.lk_levels
@@ -383,13 +391,15 @@ def main():
         print("debug view: ssh -L 8765:127.0.0.1:8765 frame  ->  http://localhost:8765", file=sys.stderr)
     logf = open(a.log, "a") if a.log else None
 
-    palm = None if a.no_bridge else PalmTracker(a.size)
+    palm = PalmTracker(a.size) if not a.no_bridge or a.backend == "mercury" else None
     mt = None
+    merc_pool = None
     if a.backend == "mercury":
         # continuous per-hand tracking with Mercury's keypoint model, in its own process
         from handtrack.merctrack import MercuryTracker
         merc_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
-                                        initializer=mpworker.init_mercury_proc)
+                                        initializer=mpworker.init_mercury_proc,
+                                        initargs=(a.merc_inference, a.framenpu_jobs))
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched
@@ -409,6 +419,10 @@ def main():
     lock = threading.Lock()
     stats = new_stats()
     stop = threading.Event()
+    # Dashboard stop sends SIGTERM. Let the worker retire its image and release
+    # held power before ProcessPoolExecutor exits.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
     NAME = {0: "cam0 (right)", 1: "cam1 (left)"}
 
     pool = ThreadPoolExecutor(2)
@@ -534,9 +548,9 @@ def main():
                     # thread CPU vs runqueue wait, hands in the job, outcome, raw (unfiltered) orientation
                     for rc in mt.records:
                         q_ = rc["rq"] if rc["rq"] is not None else (0, 0, 0, 0)
-                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f,%d" % (
+                        tel.write("R,%d,%s,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%s,%.4f,%.4f,%.4f,%.4f,%d,%s,%d,%.3f" % (
                             rc["id"], rc["side"], rc["slot"], rc["t_cap"], rc["t_sub"], rc["t0"], rc["t1"], rc["t_col"],
-                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_, rc["hint"]))
+                            rc["cpu_ns"] / 1e6, rc["wait_ns"] / 1e6, rc["njob"], rc["outcome"], *q_, rc["hint"], rc["inference"], rc["request_crops"], rc["dsp_body_ms"]))
                 mt.records.clear()
                 if mt.collapsed:
                     # both trackers ended up on one physical hand: forget the dropped one everywhere and
@@ -547,6 +561,8 @@ def main():
                     next_det = 0.0
                     if tel is not None:
                         tel.write("C,%d,%s" % (t_cap, mt.collapsed))
+                if not mt.busy() and not mt.tracked():
+                    mt.idle()
                 if not mt.busy() and time.monotonic() >= next_merc:
                     # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
                     n_ = max(1, len(mt.hands)) if a.merc_sched == "perhand" else 1
@@ -558,6 +574,8 @@ def main():
                            if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
                     if iv is not None and mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_):
                         next_merc = time.monotonic() + iv
+                    else:
+                        mt.idle()
 
 
         hands_cfg = EnabledHands()
@@ -910,7 +928,7 @@ def main():
         t.start()
     t0 = tstat = time.monotonic()
     try:
-        while not a.seconds or time.monotonic() - t0 < a.seconds:
+        while not stop.is_set() and (not a.seconds or time.monotonic() - t0 < a.seconds):
             time.sleep(0.25)
             now = time.monotonic()
             if now - tstat > 5:
@@ -951,9 +969,17 @@ def main():
                 tstat = now
     except KeyboardInterrupt:
         pass
-    stop.set()
-    for t in threads:
-        t.join(1)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(1)
+        if merc_pool is not None:
+            try:
+                merc_pool.submit(mpworker.close_mercury).result()
+            finally:
+                merc_pool.shutdown(wait=True)
+        mp_pool.shutdown(wait=True)
+        pool.shutdown(wait=True)
 
 
 if __name__ == "__main__":

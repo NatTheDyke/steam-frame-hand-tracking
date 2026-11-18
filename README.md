@@ -26,6 +26,13 @@ back on the controller.**
 - Works with Valve's normal Frame streaming. Any app with Frame-controller bindings works.
 - Status, measurements and limitations: **[REPORT.md](REPORT.md)**; latest latency work: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md); next research: [RESEARCH_BRIEF_V3.md](RESEARCH_BRIEF_V3.md).
 
+## Optional FrameNPU inference
+
+Mercury tracking can use a pluggable FrameNPU inference backend with automatic
+CPU fallback. CPU remains the default. Available crops are submitted immediately
+in groups of one to three; the worker never waits for a third crop.
+Setup, selection and validation: [docs/FRAMENPU.md](docs/FRAMENPU.md).
+
 ## The panel
 
 ![Hand Tracking panel](overlay/panel_preview.png)

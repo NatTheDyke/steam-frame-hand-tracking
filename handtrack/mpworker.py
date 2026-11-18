@@ -38,6 +38,7 @@ def init(gpu=False, mirrored=True):
 
 
 _merc = None
+_merc_config = {}
 
 
 def init_mercury():
@@ -48,11 +49,11 @@ def init_mercury():
         from handtrack.mercury_kp import MercuryKeypoint
         from handtrack.palm import SLOT_CAM
         _merc = MercuryKeypoint(os.path.expanduser("~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"),
-                                Rig(), SLOT_CAM, 640)
+                                Rig(), SLOT_CAM, 640, **_merc_config)
     return _merc
 
 
-def init_mercury_proc():
+def init_mercury_proc(inference="cpu", framenpu_jobs=None):
     """Initializer for the dedicated Mercury worker process (no MediaPipe in it)."""
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(v, "1")
@@ -61,7 +62,23 @@ def init_mercury_proc():
         os.nice(10)
     except (AttributeError, OSError):
         pass
+    global _merc_config
+    _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs)
     init_mercury()
+    from multiprocessing.util import Finalize
+    Finalize(None, close_mercury, exitpriority=10)
+
+
+def idle_mercury():
+    if _merc is not None:
+        _merc.idle()
+
+
+def close_mercury():
+    global _merc
+    if _merc is not None:
+        current, _merc = _merc, None
+        current.close()
 
 
 def _schedstat():
@@ -78,21 +95,29 @@ def run_mercury(jobs, imgs):
     """jobs: [(slot, side, joints_cv (21,3))]; ROI from those joints, same images MediaPipe saw.
     Returns [(slot, side, result-without-crop or None, seconds, timing)] where timing =
     {t0, t1: CLOCK_MONOTONIC ns around this crop (same clock as the tracker), cpu_ns: thread CPU
-    time, wait_ns: runqueue wait (schedstat) during the crop}."""
+    time, wait_ns: runqueue wait (schedstat) during the crop group}."""
     import time
     mk = init_mercury()
     out = []
-    for job in jobs:
-        slot, side, jc = job[:3]
-        expand = job[3] if len(job) > 3 else None
-        hint = job[4] if len(job) > 4 else True
+    for start in range(0, len(jobs), 3):
+        group = jobs[start:start + 3]
+        observations = [dict(slot=j[0], det_img=imgs[j[0]], joints_cv=j[2],
+                             flip=(j[1] == "right"), expand=j[3] if len(j) > 3 else None,
+                             use_hint=j[4] if len(j) > 4 else True) for j in group]
         s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
-        r = mk.run(slot, imgs[slot], jc, flip=(side == "right"), expand=expand, use_hint=hint)
+        results = mk.run_many(observations)
         dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
-        if r is not None:
-            r.pop("crop", None)
-        out.append((slot, side, r, dsec, {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0], "wait_ns": s1[1] - s0[1],
-                                          "hint": hint}))
+        timing = (getattr(mk.backend, "last_timing", None) or {}) if any(r is not None for r in results) else {}
+        for job, observation, r in zip(group, observations, results):
+            if r is not None:
+                r.pop("crop", None)
+            # Group wall time is the latency of each observation, not wall/count.
+            out.append((job[0], job[1], r, dsec,
+                        {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0],
+                         "wait_ns": s1[1] - s0[1], "hint": observation["use_hint"],
+                         "batch_crops": len(group), "inference": mk.backend.name,
+                         "request_crops": timing.get("crops", sum(r is not None for r in results)),
+                         "dsp_body_ms": timing.get("body_ms", 0.0)}))
     return out
 
 
