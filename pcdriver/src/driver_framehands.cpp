@@ -150,6 +150,9 @@ struct Config {
     double interpDelayMs = 0;       // present the hand state this far in the past (interpolated)
     double velWindowMs = 50;        // velocity = regression over samples within this window
     double holdMs = 250;            // newest sample older than this: hold, out of range, no velocity
+    // world-space One Euro filter on the hand position (0 = off).  Smoothing here, after the hand is
+    // placed in the world, cannot make a still hand follow the head (smoothing in the head frame does).
+    double posMinCutoff = 0, posBeta = 0, posDCutoff = 1.0;
     double maxVelocity = 3.0, maxAngularVelocity = 15.0, maxJumpCm = 15;
     double stillSeconds = 0.8, stillCm = 2.0, stillDeg = 6.0, handAwayCm = 10;
     double pickupCm = 4.0, pickupDeg = 15.0;
@@ -198,6 +201,9 @@ static void loadLiveConfig(const std::string &path, bool log) {
         else if (key == "interpDelayMs") c.interpDelayMs = d;
         else if (key == "velWindowMs") c.velWindowMs = d;
         else if (key == "holdMs") c.holdMs = d;
+        else if (key == "posMinCutoff") c.posMinCutoff = d;
+        else if (key == "posBeta") c.posBeta = d;
+        else if (key == "posDCutoff") c.posDCutoff = d;
         else if (key == "maxVelocity") c.maxVelocity = d;
         else if (key == "maxAngularVelocity") c.maxAngularVelocity = d;
         else if (key == "maxJumpCm") c.maxJumpCm = d;
@@ -220,10 +226,10 @@ static void loadLiveConfig(const std::string &path, bool log) {
     if (log)
         Log("framehands: config predictLinear=%d predictAngular=%d maxPredictMs=%.0f interpDelayMs=%.0f velWindowMs=%.0f "
             "holdMs=%.0f maxVel=%.1f maxAngVel=%.1f maxJumpCm=%.0f still=%.1fs/%.1fcm/%.0fdeg handAway=%.0fcm "
-            "pickup=%.1fcm/%.0fdeg force=%d host=%s:%d",
+            "pickup=%.1fcm/%.0fdeg force=%d host=%s:%d posFilter=%.2f/%.2f",
             c.predictLinear, c.predictAngular, c.maxPredictMs, c.interpDelayMs, c.velWindowMs, c.holdMs, c.maxVelocity,
             c.maxAngularVelocity, c.maxJumpCm, c.stillSeconds, c.stillCm, c.stillDeg, c.handAwayCm, c.pickupCm,
-            c.pickupDeg, c.forceHandMode, c.headsetHost.c_str(), c.port);
+            c.pickupDeg, c.forceHandMode, c.headsetHost.c_str(), c.port, c.posMinCutoff, c.posBeta);
 }
 
 // ---------------------------------------------------------------- clock mapping (ping/pong)
@@ -436,10 +442,13 @@ public:
     }
 
     // A new hand sample (head frame, capture time already mapped to PC clock) -> world sample.
-    void ingest(const FhHand &h, int64_t tCapPc, Stats &st) {
-        double hp[3], q0p[3];
-        Quat qh;
-        if (!g_hmd.at(tCapPc, hp, qh)) {
+    // Position and orientation each use the head pose of their own observation time (v4 ages).
+    void ingest(const FhHand &h, int64_t tCapPc, const Config &c, Stats &st) {
+        double hp[3], q0p[3], hpR[3];
+        Quat qh, qhR;
+        int64_t tPos = tCapPc - int64_t(std::max(0.0f, h.posAgeMs) * 1e6);
+        int64_t tRot = tCapPc - int64_t(std::max(0.0f, h.rotAgeMs) * 1e6);
+        if (!g_hmd.at(tPos, hp, qh) || !g_hmd.at(tRot, hpR, qhR)) {
             st.hmdMiss++;
             return;
         }
@@ -447,7 +456,7 @@ public:
         rotate(qh, pin, wp);
         for (int i = 0; i < 3; i++) wp[i] += hp[i];
         for (int i = 0; i < 3; i++) palmWorld_[i] = wp[i];
-        Quat wq = mul(qh, Quat{h.quat[0], h.quat[1], h.quat[2], h.quat[3]});
+        Quat wq = mul(qhR, Quat{h.quat[0], h.quat[1], h.quat[2], h.quat[3]});
         // palm pose -> controller (/pose/raw) pose: ctrl = palm x inverse(palm-in-raw)
         wq = mul(wq, conj(palmQ_));
         rotate(wq, palmT_, q0p);
@@ -458,6 +467,7 @@ public:
             if (tCapPc <= l.t) return;   // duplicate / out of order
             st.sampleGapMs.push_back((tCapPc - l.t) / 1e6);
         }
+        filterPosition(wp, tCapPc, c);
         samples_.push_back({tCapPc, {wp[0], wp[1], wp[2]}, wq});
         while (samples_.size() > 64) samples_.pop_front();
         curls_ = {h.curl[0], h.curl[1], h.curl[2], h.curl[3], h.curl[4]};
@@ -596,6 +606,36 @@ private:
     Quat palmQ_{1, 0, 0, 0};
     double palmT_[3] = {};
     double palmWorld_[3] = {};
+
+    // One Euro filter (Casiez et al.) on the world position; restarts after a tracking gap.
+    double fx_[3] = {}, fdx_[3] = {};
+    int64_t ft_ = 0;
+    bool fHave_ = false;
+    static double alpha(double cutoff, double dt) {
+        double r = 2 * M_PI * cutoff * dt;
+        return r / (r + 1);
+    }
+    void filterPosition(double p[3], int64_t t, const Config &c) {
+        if (c.posMinCutoff <= 0) { fHave_ = false; return; }
+        double dt = fHave_ ? (t - ft_) / 1e9 : 0;
+        if (!fHave_ || dt <= 0 || dt * 1000 > c.holdMs) {
+            for (int i = 0; i < 3; i++) { fx_[i] = p[i]; fdx_[i] = 0; }
+            ft_ = t;
+            fHave_ = true;
+            return;
+        }
+        double ad = alpha(c.posDCutoff, dt), speed = 0;
+        for (int i = 0; i < 3; i++) {
+            fdx_[i] += ad * ((p[i] - fx_[i]) / dt - fdx_[i]);
+            speed += fdx_[i] * fdx_[i];
+        }
+        double a = alpha(c.posMinCutoff + c.posBeta * sqrt(speed), dt);
+        for (int i = 0; i < 3; i++) {
+            fx_[i] += a * (p[i] - fx_[i]);
+            p[i] = fx_[i];
+        }
+        ft_ = t;
+    }
 };
 
 // ---------------------------------------------------------------- set-down detection
@@ -741,7 +781,7 @@ public:
             int64_t tCapPc;
             if (g_clock.hsToPc((int64_t)pk.tCapNs, tCapPc))
                 for (int i = 0; i < 2; i++)
-                    if (pk.hand[i].valid) hands_[i]->ingest(pk.hand[i], tCapPc, stats_[i]);
+                    if (pk.hand[i].valid) hands_[i]->ingest(pk.hand[i], tCapPc, c, stats_[i]);
         }
 
         for (uint32_t i = 1; i < k_unMaxTrackedDeviceCount; i++) {
@@ -856,7 +896,7 @@ private:
             g_state.have = true;
             g_state.packets++;
             if (!logged) {
-                Log("framehands: receiving hand data (v3) from headset");
+                Log("framehands: receiving hand data (v%u) from headset", FH_VERSION);
                 logged = true;
             }
         }

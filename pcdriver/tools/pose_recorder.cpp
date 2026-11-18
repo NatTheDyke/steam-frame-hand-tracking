@@ -1,11 +1,26 @@
 // pose_recorder — records what SteamVR presents for the framehands virtual controllers (and the
 // HMD) once per display vsync, as an application would query it (predicted to photons).
-// Loads SteamVR's own openvr_api.dll; no install needed.
+// Loads SteamVR's own openvr_api library (openvr_api.dll / libopenvr_api.so); no install needed.
 //
-//   pose_recorder.exe OUT.csv SECONDS
+//   pose_recorder.exe OUT.csv SECONDS          (Windows)
+//   pose_recorder OUT.csv SECONDS              (Linux: g++ -O2 -std=c++17 -Ipcdriver/openvr
+//                                               pcdriver/tools/pose_recorder.cpp -o pose_recorder -ldl)
+//   Linux library path: $STEAMVR/bin/linux64/libopenvr_api.so, STEAMVR defaults to
+//   ~/.local/share/Steam/steamapps/common/SteamVR
 // CSV: t_ns,frame,device,valid,x,y,z,qw,qx,qy,qz   (device: hmd | left | right)
 #include <openvr.h>
+#ifdef _WIN32
 #include <windows.h>
+#define LIBLOAD(p) LoadLibraryA(p)
+#define LIBSYM(l, n) GetProcAddress(l, n)
+typedef HMODULE LibHandle;
+#else
+#include <dlfcn.h>
+#include <cstdlib>
+#define LIBLOAD(p) dlopen(p, RTLD_NOW)
+#define LIBSYM(l, n) dlsym(l, n)
+typedef void *LibHandle;
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -39,11 +54,18 @@ static void quatOf(const HmdMatrix34_t &m, double q[4]) {
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: pose_recorder OUT.csv SECONDS\n"); return 2; }
-    HMODULE lib = LoadLibraryA("C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\bin\\win64\\openvr_api.dll");
-    if (!lib) { fprintf(stderr, "cannot load openvr_api.dll\n"); return 1; }
-    auto init = (PFN_Init)GetProcAddress(lib, "VR_InitInternal2");
-    auto getIf = (PFN_GetIf)GetProcAddress(lib, "VR_GetGenericInterface");
-    auto shut = (PFN_Shutdown)GetProcAddress(lib, "VR_ShutdownInternal");
+#ifdef _WIN32
+    std::string libPath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\bin\\win64\\openvr_api.dll";
+#else
+    const char *svr = getenv("STEAMVR");
+    std::string libPath = (svr ? std::string(svr) : std::string(getenv("HOME")) + "/.local/share/Steam/steamapps/common/SteamVR") +
+                          "/bin/linux64/libopenvr_api.so";
+#endif
+    LibHandle lib = LIBLOAD(libPath.c_str());
+    if (!lib) { fprintf(stderr, "cannot load %s\n", libPath.c_str()); return 1; }
+    auto init = (PFN_Init)LIBSYM(lib, "VR_InitInternal2");
+    auto getIf = (PFN_GetIf)LIBSYM(lib, "VR_GetGenericInterface");
+    auto shut = (PFN_Shutdown)LIBSYM(lib, "VR_ShutdownInternal");
     EVRInitError e;
     init(&e, VRApplication_Background, nullptr);
     if (e != VRInitError_None) { fprintf(stderr, "VR init failed %d\n", e); return 1; }

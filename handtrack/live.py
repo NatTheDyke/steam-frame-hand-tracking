@@ -70,11 +70,14 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 #   curl_filter   = <min_cutoff> <beta> | off   finger curls One Euro
 #   pos_filter    = <min_cutoff> <beta> | off   sent position One Euro (fast path)
 #   rot_glide_ms  = <ms>  (0 = off)             exponential glide toward the newest orientation
+#   send_offset_ms = <ms> (default 0)           shift the capture time sent to the PC driver, which picks the
+#                                               head pose for placing the hand in the world by that time
+#                                               (diagnostic for hands that move with the head)
 # Default = "A" from the 2026-10-11 latency pass: smoother than before when the hand is still, faster when
 # it moves (orientation lag ~130 vs ~160 ms, same still-hand jitter).  The previous smooth profile is
 # tools/profile_smooth_v1.conf (copy it to ~/.config/mrhand/profile to go back).
 PROFILE_DEFAULTS = {"axis_filter": (0.4, 1.2), "centre_filter": (1.5, 0.6), "curl_filter": (1.0, 1.0),
-                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0}
+                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0}
 
 
 class Profile:
@@ -91,7 +94,7 @@ class Profile:
             k, val = (s.strip() for s in line.split("=", 1))
             if k not in v:
                 continue
-            if k == "rot_glide_ms":
+            if k in ("rot_glide_ms", "send_offset_ms"):
                 v[k] = float(val)
             elif val == "off":
                 v[k] = None
@@ -652,6 +655,7 @@ def main():
         have_frame = False
         prof = Profile()
         pv = dict(PROFILE_DEFAULTS)                 # apply the defaults once, then live changes
+        send_off_ns = 0
         while not stop.is_set():
             if pv is None:
                 pv = prof.poll()
@@ -665,6 +669,7 @@ def main():
                         palm.curl_filt[sd].set(pv["curl_filter"])
                     pos_filt[sd].set(pv["pos_filter"])
                 rot_tau = (a.rot_smooth_ms if pv["rot_glide_ms"] is None else pv["rot_glide_ms"]) / 1000.0
+                send_off_ns = int(pv["send_offset_ms"] * 1e6)
                 if tel is not None:   # profile switch marker: the report can split results by profile
                     tel.write("P,%d,%s" % (time.monotonic_ns(), ";".join(
                         "%s=%s" % (k, "off" if v is None else (v if not isinstance(v, tuple) else "%g/%g" % v))
@@ -902,6 +907,7 @@ def main():
             if skip_frame:
                 continue
             poses = {}
+            ages = {}            # side -> (position age, orientation age) in ms before t_cap (bridge v4)
             tel_rows = []
             for side in ("left", "right"):
                 sp = slow.get(side)
@@ -963,8 +969,9 @@ def main():
                 last_sent[side] = (t_s, pos)
                 poses[side] = (pos, q, sp[2], sp[3], sp[4])
                 tel_rows.append((side, pos_src, pos_t, q_src, q_t, slow_t[side], finfo.get("npts", {}), pos, q))
+                ages[side] = ((t_s - pos_t) * 1e3, (t_s - q_t) * 1e3)
             if bridge:
-                bridge.send(poses, t_cap)
+                bridge.send(poses, t_cap + send_off_ns, ages)
             if tel is not None and tel_rows:
                 t_send = time.monotonic_ns()
                 for (sd, psrc, pt, qsrc, qt, ct, npts, pp, qq) in tel_rows:

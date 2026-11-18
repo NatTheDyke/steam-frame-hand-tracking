@@ -283,11 +283,16 @@ class PalmTracker:
 
 
 # ---------------------------------------------------------------- UDP bridge
-FH_MAGIC, FH_VERSION, FH_PORT, FH_SUBSCRIBE = 0x444E4846, 3, 47811, 1
-FH_VERSIONS = (2, 3)                     # served per subscriber (old driver = v2)
+FH_MAGIC, FH_VERSION, FH_PORT, FH_SUBSCRIBE = 0x444E4846, 4, 47811, 1
+FH_VERSIONS = (2, 3, 4)                  # served per subscriber (old driver = v2 / v3)
 _HAND = struct.Struct("<If3f4ff5f5f")   # FhHand: valid, conf, pos[3], quat[4], ageMs, curl[5], splay[5]
+# v4 FhHand adds posAgeMs, rotAgeMs: how much older than tCapNs this hand's position / orientation
+# observation is (held positions, MediaPipe / Mercury results).  The driver places each with the head
+# pose of its own observation time, so values the tracker holds in the head frame stay put in the world.
+_HAND4 = struct.Struct("<If3f4ff5f5fff")
 _PKT_HEAD = {2: struct.Struct("<IIQII"),     # magic, version, seq, mode, pad
-             3: struct.Struct("<IIQQII")}    # magic, version, seq, tCapNs (headset CLOCK_MONOTONIC), mode, pad
+             3: struct.Struct("<IIQQII"),    # magic, version, seq, tCapNs (headset CLOCK_MONOTONIC), mode, pad
+             4: struct.Struct("<IIQQII")}    # same header as v3
 
 
 class Bridge:
@@ -325,7 +330,7 @@ class Bridge:
                 # clock ping: answer immediately with our CLOCK_MONOTONIC receive time (FhPong)
                 pc_send = struct.unpack_from("<Q", data, 16)[0]
                 try:
-                    self.sock.sendto(struct.pack("<IIIIQQ", FH_MAGIC, 3, 2, 0, pc_send, t_rx), addr)
+                    self.sock.sendto(struct.pack("<IIIIQQ", FH_MAGIC, ver, 2, 0, pc_send, t_rx), addr)
                 except OSError:
                     pass
             with self.lock:
@@ -334,8 +339,9 @@ class Bridge:
             if old is None or old[1] != ver:
                 print("bridge: subscriber %s:%d (protocol v%d)" % (addr[0], addr[1], ver), flush=True)
 
-    def send(self, hands, t_cap_ns):
-        """hands: {"left": pose|None, "right": pose|None}; t_cap_ns: capture time (headset monotonic ns)."""
+    def send(self, hands, t_cap_ns, ages=None):
+        """hands: {"left": pose|None, "right": pose|None}; t_cap_ns: capture time (headset monotonic ns);
+        ages: {side: (pos_age_ms, rot_age_ms)} relative to t_cap_ns (v4 subscribers; missing = 0)."""
         now = time.monotonic()
         with self.lock:
             self.subs = {a: v for a, v in self.subs.items() if now - v[0] < 5}
@@ -344,19 +350,25 @@ class Bridge:
             return
         age = (time.monotonic_ns() - t_cap_ns) / 1e6
         self.seq += 1
-        body = b""
+        body, body4 = b"", b""
+        ages = ages or {}
         for side in ("left", "right"):
             p = hands.get(side)
             if p is None:
-                body += _HAND.pack(0, 0, 0, 0, 0, 1, 0, 0, 0, age, *([0.0] * 10))
+                fields = (0, 0, 0, 0, 0, 1, 0, 0, 0, age, *([0.0] * 10))
+                pa, ra = 0.0, 0.0
             else:
                 pos, q, conf = p[0], p[1], p[2]
                 curls = p[4] if len(p) > 4 else np.zeros(5)
-                body += _HAND.pack(1, conf, *map(float, pos), *map(float, q), age, *map(float, curls), *([0.0] * 5))
+                fields = (1, conf, *map(float, pos), *map(float, q), age, *map(float, curls), *([0.0] * 5))
+                pa, ra = (max(0.0, float(v)) for v in ages.get(side, (0.0, 0.0)))
+            body += _HAND.pack(*fields)
+            body4 += _HAND4.pack(*fields, pa, ra)
         # v3 "pad" carries the enabled hands: bit 31 = present, bit 0 = left, bit 1 = right
         flags = 0x80000000 | self.enabled_mask
         bufs = {2: _PKT_HEAD[2].pack(FH_MAGIC, 2, self.seq, 1, 0) + body,
-                3: _PKT_HEAD[3].pack(FH_MAGIC, 3, self.seq, int(t_cap_ns), 1, flags) + body}
+                3: _PKT_HEAD[3].pack(FH_MAGIC, 3, self.seq, int(t_cap_ns), 1, flags) + body,
+                4: _PKT_HEAD[4].pack(FH_MAGIC, 4, self.seq, int(t_cap_ns), 1, flags) + body4}
         for a, (_, ver) in subs:
             try:
                 self.sock.sendto(bufs[ver], a)

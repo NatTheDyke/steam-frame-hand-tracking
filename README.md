@@ -26,6 +26,31 @@ back on the controller.**
 - Works with Valve's normal Frame streaming. Any app with Frame-controller bindings works.
 - Status, measurements and limitations: **[REPORT.md](REPORT.md)**; latest latency work: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md); next research: [RESEARCH_BRIEF_V3.md](RESEARCH_BRIEF_V3.md).
 
+## Hands in games: the tracking cameras (`--source slam`)
+
+XRService pauses the passthrough cameras whenever room view is off, which is all the time inside a
+game, so the passthrough source sees nothing there. `--source slam` uses the Frame's two lower
+**tracking (SLAM) cameras** instead. They keep running whenever head tracking runs, including in
+games, and see more of the space in front of you (wide fisheye: in a synthetic test 400/400 hand
+positions in both cameras, against 351/400 for passthrough).
+
+- `capture/slamgrab` reads the frames read-only from buffers XRService already owns (the reader never
+  writes to them or pauses XRService). It publishes the scene exposures (30 Hz per camera, 1056x1024)
+  to `/dev/shm/mrhand-slam` with their exact capture time, and drops the controller-LED exposures in
+  between. Frame age when the tracker reads it: ~10 ms, ~8 ms of it inside XRService. CPU: ~4% of a core.
+- It needs one capability, and only around the buffer handoff:
+  `sudo setcap cap_sys_ptrace+p capture/build/slamgrab` (again after every rebuild; it does not work
+  from a `nosuid` mount such as `/tmp`).
+- `headset/start_args` selects it, and `start.sh` starts `slamgrab` instead of `ptgrab`. Use it with
+  `tools/profile_slam.conf` as `~/.config/mrhand/profile`, the PC driver from this branch (protocol v4)
+  and `pcdriver/framehands/framehands_live.ini` (prediction and world-space smoothing on).
+- Status 2026-11-18: hands are tracked in Half-Life: Alyx with passthrough off. Smoother and less laggy
+  than it was, but not yet good: position is 30 Hz, and orientation and fingers lag ~100+ ms.
+  Off-centre hands are tracked less well.
+- Layout facts the reader relies on, from XRService in SteamVR 2.19.2 on the headset: image and metadata
+  buffers are allocated in pairs, right camera first. The reader refuses a layout it does not
+  recognise rather than guessing.
+
 ## Optional FrameNPU inference
 
 Mercury tracking can use a pluggable FrameNPU inference backend with automatic
@@ -71,7 +96,11 @@ How loose the set-down / pick-up rules are is in `pcdriver/framehands/framehands
 ### Smoothing
 
 The wrist/finger smoothing can be changed live with `~/.config/mrhand/profile` (no restart; delete the
-file to return to the default). The default favours smooth slow movement with less lag than before.
+file to return to the default). Do not smooth position in the tracker (head frame): with the PC driver
+from this branch, use `posMinCutoff` / `posBeta` in `framehands_live.ini` (world space) and
+`tools/profile_slam.conf`. Head-frame smoothing makes a still hand follow head turns.
+`pcdriver/tools/pose_recorder` records what SteamVR presents (Windows and Linux); hold a hand still and
+turn your head to measure this. The default favours smooth slow movement with less lag than before.
 For the previous, smoothest setting: `cp ~/handtrack/src/tools/profile_smooth_v1.conf ~/.config/mrhand/profile`.
 Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 
@@ -93,7 +122,8 @@ Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 ```
 # Python venv with mediapipe, opencv-python, numpy, onnxruntime in ~/handtrack/venv
 tools/fetch_models.sh                                  # models are downloaded, not in the repo
-capture/build.sh && capture/install.sh                 # build camera-sharing Vulkan layer + ptgrab, install the layer
+capture/build.sh && capture/install.sh                 # build camera-sharing Vulkan layer + ptgrab + slamgrab, install the layer
+sudo setcap cap_sys_ptrace+p capture/build/slamgrab    # tracking-camera source (games); see above
 touch ~/.config/mrhand/enable-capture
 systemctl --user restart steamvr                       # compositor loads the layer
 cp headset/*.sh headset/start_args ~/handtrack/        # start.sh / stop.sh
@@ -148,7 +178,7 @@ PC:     framehands SteamVR driver ─▶ two virtual Frame controllers (pose + 3
 
 | Path | Runs on | What |
 |---|---|---|
-| `capture/` | Frame | `handcam_layer.cpp`: passive Vulkan layer in vrcompositor that shares the camera buffers (opt-in flag + crash guard). `ptgrab.cpp`: reads them on its own GPU queue, downscales, publishes `/dev/shm/mrhand-pt` |
+| `capture/` | Frame | `handcam_layer.cpp`: passive Vulkan layer in vrcompositor that shares the camera buffers (opt-in flag + crash guard). `ptgrab.cpp`: reads them on its own GPU queue, downscales, publishes `/dev/shm/mrhand-pt`. `slamgrab.cpp`: tracking-camera frames from XRService's buffers -> `/dev/shm/mrhand-slam` |
 | `handtrack/` | Frame | the tracker: `live.py` main loop, `fasttrack.py` optical flow, `merctrack.py`/`mercury_kp.py` Mercury keypoints, `detect.py`/`mpworker.py` MediaPipe, `palm.py` pose + UDP bridge, `watchdog.py` |
 | `headset/` | Frame | `start.sh`, `stop.sh`, `rollback.sh`, `start_args` |
 | `overlay/` | Frame | the Hand Tracking dashboard panel |

@@ -6,11 +6,15 @@
 // each with FhPong carrying its own CLOCK_MONOTONIC receive time, so the driver
 // can estimate the headset->PC clock offset and its uncertainty (ping/pong, lowest
 // round trips).  Hand packets carry the camera capture time in headset clock.
+// v4: each hand also carries posAgeMs / rotAgeMs, how much older than tCapNs its position /
+// orientation observation is.  The driver places each with the head pose of its own observation
+// time, so a hand position the tracker holds (or smooths) in the head frame does not follow the head.
+// (The headset serves v2/v3/v4 per subscriber, so older drivers keep working.)
 #pragma once
 #include <stdint.h>
 
 #define FH_MAGIC 0x444e4846u   // "FHND"
-#define FH_VERSION 3u
+#define FH_VERSION 4u
 #define FH_PORT 47811
 #define FH_KIND_PING 1u        // PC -> headset: subscribe + clock ping
 #define FH_KIND_PONG 2u        // headset -> PC
@@ -34,6 +38,8 @@ struct FhHand {
     float ageMs;          // capture -> send (headset clock)
     float curl[5];        // thumb, index, middle, ring, pinky: 0 open .. 1 fully curled
     float splay[5];       // -1..1 (not computed yet: 0)
+    float posAgeMs;       // v4: tCapNs minus this hand's position observation time (>= 0)
+    float rotAgeMs;       // v4: tCapNs minus this hand's orientation observation time (>= 0)
 };
 struct FhHandPacket {
     uint32_t magic, version;
