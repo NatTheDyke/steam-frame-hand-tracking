@@ -110,12 +110,22 @@ vrpathreg adddriver <repo>\pcdriver\framehands
 Set `headsetHost` in `pcdriver\framehands\framehands_live.ini` to the Frame's IP, then restart
 SteamVR. The driver DLL can only be replaced while PC SteamVR is closed.
 
+### PC (Linux SteamVR)
+
+```
+pcdriver/build.sh                                      # g++; framehands/bin/linux64/driver_framehands.so
+~/.local/share/Steam/steamapps/common/SteamVR/bin/vrpathreg.sh adddriver <repo>/pcdriver/framehands
+```
+
+Same settings file and `headsetHost`; restart SteamVR after building. Proton games use the native
+Linux SteamVR, so they see the hands too.
+
 ### Removing it
 
 - Headset: panel → both hands OFF (or `~/handtrack/stop.sh`); `capture/uninstall.sh` removes the
   layer; `overlay/install_overlay.sh --remove` removes the panel; `headset/rollback.sh` removes the
   `camera/enableCamera` setting an early probe added.
-- PC: `vrpathreg removedriver <repo>\pcdriver\framehands`.
+- PC: `vrpathreg removedriver <repo>\pcdriver\framehands` (Linux: `vrpathreg.sh removedriver ...`).
 
 ---
 

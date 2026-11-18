@@ -23,11 +23,26 @@
 // expected to be used.
 #include <openvr_driver.h>
 
+#ifdef _WIN32
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#define FH_EXPORT extern "C" __declspec(dllexport)
+#else   // Linux SteamVR: POSIX sockets, built as framehands/bin/linux64/driver_framehands.so
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#define FH_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -43,7 +58,9 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 using namespace vr;
 
@@ -149,13 +166,19 @@ static Config cfg() {
 }
 
 static std::string driverDir() {
+#ifdef _WIN32
     HMODULE h = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)&driverDir, &h);
     char p[MAX_PATH] = {};
     GetModuleFileNameA(h, p, MAX_PATH);
     std::string s(p);
-    for (int i = 0; i < 3; i++) s = s.substr(0, s.find_last_of("\\/"));   // ...\framehands\bin\win64\x.dll
+#else
+    Dl_info info{};
+    dladdr((void *)&driverDir, &info);
+    std::string s(info.dli_fname ? info.dli_fname : "");   // .../framehands/bin/linux64/x.so
+#endif
+    for (int i = 0; i < 3; i++) s = s.substr(0, s.find_last_of("\\/"));   // ...\framehands\bin\win64\x.dll (Windows)
     return s;
 }
 
@@ -638,11 +661,13 @@ class Provider : public IServerTrackedDeviceProvider {
 public:
     EVRInitError Init(IVRDriverContext *ctx) override {
         VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
-        livePath_ = driverDir() + "\\framehands_live.ini";
+        livePath_ = driverDir() + "/framehands_live.ini";
         loadLiveConfig(livePath_, true);
         Log("framehands v3: live config %s", livePath_.c_str());
+#ifdef _WIN32
         WSADATA w;
         WSAStartup(MAKEWORD(2, 2), &w);
+#endif
         for (int i = 0; i < 2; i++) {
             hands_[i] = new HandController(i);
             VRServerDriverHost()->TrackedDeviceAdded(i ? "framehands-right" : "framehands-left",
@@ -656,7 +681,9 @@ public:
         running_ = false;
         if (sock_ != INVALID_SOCKET) closesocket(sock_);
         if (net_.joinable()) net_.join();
+#ifdef _WIN32
         WSACleanup();
+#endif
     }
     const char *const *GetInterfaceVersions() override { return k_InterfaceVersions; }
 
@@ -665,9 +692,15 @@ public:
         // live config, once a second
         if (now - lastCfgCheck_ > 1000000000LL) {
             lastCfgCheck_ = now;
+#ifdef _WIN32
             WIN32_FILE_ATTRIBUTE_DATA fa;
             if (GetFileAttributesExA(livePath_.c_str(), GetFileExInfoStandard, &fa)) {
                 uint64_t mt = (uint64_t(fa.ftLastWriteTime.dwHighDateTime) << 32) | fa.ftLastWriteTime.dwLowDateTime;
+#else
+            struct stat st;
+            if (stat(livePath_.c_str(), &st) == 0) {
+                uint64_t mt = uint64_t(st.st_mtim.tv_sec) * 1000000000ull + uint64_t(st.st_mtim.tv_nsec);
+#endif
                 if (mt != cfgMtime_) {
                     cfgMtime_ = mt;
                     loadLiveConfig(livePath_, true);
@@ -767,7 +800,11 @@ public:
 private:
     void netLoop() {
         sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#ifdef _WIN32
         DWORD tmo = 20;
+#else
+        timeval tmo{0, 20000};
+#endif
         setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
         int64_t lastPing = 0;
         bool logged = false;
@@ -775,7 +812,7 @@ private:
             Config c = cfg();
             sockaddr_in hs{};
             hs.sin_family = AF_INET;
-            hs.sin_port = htons((u_short)c.port);
+            hs.sin_port = htons((uint16_t)c.port);
             inet_pton(AF_INET, c.headsetHost.c_str(), &hs.sin_addr);
             int64_t now = nowNs();
             if (now - lastPing > 100000000LL) {   // ping (and subscribe) every 100 ms
@@ -785,7 +822,11 @@ private:
             }
             char buf[512];
             sockaddr_in from{};
+#ifdef _WIN32
             int fl = sizeof from;
+#else
+            socklen_t fl = sizeof from;
+#endif
             int n = recvfrom(sock_, buf, sizeof buf, 0, (sockaddr *)&from, &fl);
             int64_t rxNs = nowNs();
             if (n < 12 || from.sin_addr.s_addr != hs.sin_addr.s_addr) continue;   // only the configured headset
@@ -836,7 +877,7 @@ private:
 
 static Provider g_provider;
 
-extern "C" __declspec(dllexport) void *HmdDriverFactory(const char *name, int *ret) {
+FH_EXPORT void *HmdDriverFactory(const char *name, int *ret) {
     if (!strcmp(name, IServerTrackedDeviceProvider_Version)) return &g_provider;
     if (ret) *ret = VRInitError_Init_InterfaceNotFound;
     return nullptr;
