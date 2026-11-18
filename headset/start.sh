@@ -2,13 +2,16 @@
 # Start the hand-tracking pipeline: ptgrab (camera frames), live (tracking + PC bridge),
 # and the independent thermal watchdog.  Args are passed to handtrack.live; with no args the
 # defaults in ~/handtrack/start_args are used.
-# The tracker runs under SCHED_IDLE on HANDTRACK_CPUS (default 0-4) so XRService/compositor
-# always win the CPU (passthrough banding was traced to tracker CPU contention).
+# The tracker runs under SCHED_IDLE on HANDTRACK_CPUS (default 5-6) so XRService/compositor
+# always win the CPU (passthrough banding was traced to tracker CPU contention).  5-6 keeps it off
+# cores 2-4, where XRService head tracking and most SteamVR threads run and the hottest spikes were;
+# the compositor's real-time render thread (allowed 4-6) still preempts SCHED_IDLE work there.
+# HANDTRACK_CPUS=0-4 restores the previous placement.
 cd ~/handtrack/src
 R=$XDG_RUNTIME_DIR/mrhand; mkdir -p $R
 ARGS="$*"
 [ -z "$ARGS" ] && [ -f ~/handtrack/start_args ] && ARGS=$(cat ~/handtrack/start_args)
-export HANDTRACK_CPUS=${HANDTRACK_CPUS:-0-4}
+export HANDTRACK_CPUS=${HANDTRACK_CPUS:-5-6}
 if ! kill -0 "$(cat $R/ptgrab.pid 2>/dev/null)" 2>/dev/null; then
   DISABLE_MRCHROMA=1 DISABLE_MRHAND=1 nohup nice -n 10 taskset -c 0-6 capture/build/ptgrab stream > /tmp/ptgrab.log 2>&1 &
   echo $! > $R/ptgrab.pid; sleep 1

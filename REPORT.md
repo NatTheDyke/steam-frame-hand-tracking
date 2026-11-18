@@ -161,7 +161,8 @@ measured against this harness (`tools/driver_ablation.py`, `tools/replay_sender.
   XRService ~73 % of a core, eye tracking ~18 %, plus vrcompositor/vrlink.
 - **Passthrough vertical banding** appeared with the Mercury backend. A/B: pipeline off → gone;
   ptgrab alone → no banding; tracker on → banding. XRService logged "Late WM_DONE ISR by > 1 ms" while
-  the tracker ran. Mitigation now: tracker + workers under **SCHED_IDLE** on cores 0–4. Watch for
+  the tracker ran. Mitigation: tracker + workers under **SCHED_IDLE**, on cores 5–6 by default since 2026-11-18
+  (previously 0–4; see docs/FRAMENPU.md). Watch for
   regressions whenever compute is added; it is the clearest sign of starving Valve's real-time work.
 - Thermal policy (user-set): MediaPipe half rate ≥ 88 °C, 2 Hz ≥ 90 °C, paused ≥ 92 °C (resume 88);
   fast path every other frame ≥ 90 °C; **separate watchdog stops the whole workload at ≥ 93 °C for

@@ -43,7 +43,7 @@ same environment and the user's model/calibration paths:
 
 ```sh
 sudo env HOME="$HOME" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  HANDTRACK_CPUS="${HANDTRACK_CPUS:-0-4}" \
+  HANDTRACK_CPUS="${HANDTRACK_CPUS:-5-6}" \
   ../venv/bin/python -m handtrack.live --backend mercury \
   --merc-inference framenpu --framenpu-jobs "$HOME/handtrack/framenpu-jobs"
 ```
@@ -104,8 +104,13 @@ inherit it. On the Frame, Valve's XRService, vrserver and compositor share
 cores 0-4 and keep that cluster at its top frequency, so the cap only takes
 effect on a cluster the tracker has mostly to itself. Short live trials of
 `HANDTRACK_CPUS=5-6` with `--uclamp-max 512` lowered the hottest core peaks by
-about 10 C versus the default 0-4 placement; see FrameNPU `docs/MERCURY_LIVE.md`.
-This is not yet the default.
+about 10 C versus the old 0-4 placement; see FrameNPU `docs/MERCURY_LIVE.md`.
+`headset/start.sh` now defaults to `HANDTRACK_CPUS=5-6` without a cap: in a
+later session the cap saved only about 0.2 W and added 2-3 ms of latency on
+cores 5-6. The compositor's real-time render thread may also run on 4-6, and
+its frame timing under the new placement has not been measured yet; set
+`HANDTRACK_CPUS=0-4` to return to the old placement if passthrough banding or
+dropped frames appear.
 
 Shutdown waits for the active job, releases power,
 retires the image and restores the borrowed arena. The worker also registers a
