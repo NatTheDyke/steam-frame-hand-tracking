@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Geometry self-test for handtrack.mercury_kp (no model inference, synthetic joints):
-crop mapping vs direct projection, and crop-position -> ray decoding round trip."""
+crop mapping vs direct projection, and crop-position -> ray decoding round trip; plus the palm
+tracker's detector-pixel -> ray -> stereo round trip.  Uses the active camera source
+(HANDTRACK_SOURCE=passthrough|slam, default passthrough)."""
 import os
 import sys
 
@@ -10,10 +12,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from handtrack.calib import Rig  # noqa: E402
 from handtrack.mercury_kp import (MercuryKeypoint, WSIZE, make_instructions, project_unscaled,  # noqa: E402
                                   q_rot, sg_unproject)
-from handtrack.palm import SLOT_CAM  # noqa: E402
+from handtrack import source as camsource  # noqa: E402
+from handtrack.calib import triangulate  # noqa: E402
+from handtrack.palm import PalmTracker  # noqa: E402
 
 rig = Rig()
-mk = MercuryKeypoint(os.path.expanduser("~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"), rig, SLOT_CAM, 640)
+src = camsource.active()
+SLOT_CAM = src.slot_cams
+print("source %s: %s, upright angles %s deg" % (src.name, SLOT_CAM, {s: src.angle(s) for s in (0, 1)}))
+mk = MercuryKeypoint(os.path.expanduser("~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"), rig,
+                     SLOT_CAM, 640, source=src)
 rng = np.random.default_rng(0)
 worst_px = worst_deg = 0
 for case in range(6):
@@ -50,3 +58,18 @@ for case in range(6):
             print("case %d slot %d %-5s crop-vs-direct %.4f px  decode %.5f deg  hint inside crop %.0f%%  radius %.3f" %
                   (case, slot, "right" if flip else "left", e_px, e_deg, 100 * inside, r))
 print("worst: %.4f px, %.5f deg" % (worst_px, worst_deg))
+
+# palm tracker: head point -> detector pixel in each camera -> rays -> triangulate back
+palm = PalmTracker(640, rig, source=src)
+P = np.stack([rng.uniform(-0.25, 0.25, 400), rng.uniform(-0.45, 0.05, 400), -rng.uniform(0.2, 0.6, 400)], 1)
+px = {s: palm.det_px(s, P) for s in (0, 1)}
+inside = {s: ((px[s] >= 0) & (px[s] < 640)).all(1) for s in (0, 1)}
+both = inside[0] & inside[1]
+o0, d0 = palm.rays(0, px[0][both])
+o1, d1 = palm.rays(1, px[1][both])
+Q, gap, _s, _u = triangulate(o1, d1, o0, d0)
+err = np.linalg.norm(Q - P[both], axis=1)
+print("palm round trip: %d/%d hand positions in both detector images (right %d, left %d); "
+      "triangulation error max %.2e m" % (both.sum(), len(P), inside[0].sum(), inside[1].sum(), err.max() if len(err) else 0))
+worst_m = err.max() if len(err) else 0.0
+print("PASS" if worst_px < 0.01 and worst_deg < 0.01 and worst_m < 1e-4 else "FAIL")

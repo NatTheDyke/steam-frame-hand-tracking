@@ -2,8 +2,9 @@
 UDP bridge that streams it to the PC driver (pcdriver/, FhHandPacket).
 
 Camera slots (validated against live frames, tools/check_stereo.py):
-  shm slot 1 = passthrough_left, slot 0 = passthrough_right; calibration
-  intrinsics apply directly to the raw 2464x2464 buffer pixels.
+  shm slot 1 = left camera, slot 0 = right camera; calibration intrinsics apply directly to the
+  raw buffer pixels.  Which cameras, and the raw <-> detector-image mapping, come from the active
+  camera source (handtrack/source.py: passthrough or slam).
 """
 import math
 import socket
@@ -14,15 +15,17 @@ import time
 import cv2
 import numpy as np
 
+from handtrack import source as camsource
 from handtrack.calib import Rig, triangulate
 
-SLOT_CAM = {1: "passthrough_left", 0: "passthrough_right"}
+SLOT_CAM = {1: "passthrough_left", 0: "passthrough_right"}   # passthrough source (tools / tests)
 PALM_IDX = [0, 5, 9, 13, 17]   # wrist + MCPs: rigid-ish palm points
 
 
 # ---------------------------------------------------------------- pixel mapping
 def det_to_raw(px, slot, det_size, raw_size=2464):
-    """Landmark pixels in the rotated det_size x det_size detector image -> raw buffer pixels.
+    """Passthrough only (kept for tools): detector-image pixels -> raw buffer pixels.
+    The tracker itself uses Source.det_to_raw (handtrack/source.py), which covers both sources.
     live.py: small = rotate(resize(raw, det_size), ROTATE[slot]); slot0 rotated CW, slot1 CCW."""
     u, v = px[:, 0], px[:, 1]
     S = det_size
@@ -124,11 +127,12 @@ class PalmTracker:
     DEPTH = (0.10, 1.30)     # m in front of the head
     PALM_LEN = (0.05, 0.14)  # m, wrist -> middle MCP
 
-    def __init__(self, det_size, rig=None):
+    def __init__(self, det_size, rig=None, source=None):
         self.rig = rig or Rig()
         self.det_size = det_size
-        self.cam = {s: self.rig.cams[n] for s, n in SLOT_CAM.items()}
-        self.pose = {s: self.rig.head_from_cam(n) for s, n in SLOT_CAM.items()}
+        self.src = source or camsource.active()
+        self.cam = {s: self.rig.cams[n] for s, n in self.src.slot_cams.items()}
+        self.pose = {s: self.rig.head_from_cam(n) for s, n in self.src.slot_cams.items()}
         self.filt = {side: (OneEuro(), OneEuro(1.0, 0.3), OneEuro(1.0, 0.3)) for side in ("left", "right")}
         self.curl_filt = {side: OneEuro(1.0, 1.0) for side in ("left", "right")}   # steadier when still
         self.roll_flip = False   # was a workaround for swapped hand labels (fixed in live.py: mirrored=True)
@@ -140,15 +144,11 @@ class PalmTracker:
         """Head-frame points (N,3) -> pixels in this camera's rotated detector image."""
         R, t = self.pose[slot]
         raw = self.cam[slot].project((np.atleast_2d(P) - t) @ R)
-        k = 2464 / self.det_size
-        x = (raw[:, 0] + 0.5) / k - 0.5
-        y = (raw[:, 1] + 0.5) / k - 0.5
-        S = self.det_size
-        return np.stack([S - 1 - y, x], 1) if slot == 0 else np.stack([y, S - 1 - x], 1)
+        return self.src.raw_to_det(raw, slot, self.det_size)
 
     def rays(self, slot, px):
         R, t = self.pose[slot]
-        raw = det_to_raw(px, slot, self.det_size)
+        raw = self.src.det_to_raw(px, slot, self.det_size)
         return t, self.cam[slot].unproject(raw) @ R.T
 
     def fuse(self, hands0, hands1, t_cap):
@@ -194,7 +194,7 @@ class PalmTracker:
     def mono_points(self, slot, h):
         """Fit MediaPipe's metric hand model (h.world) to the 2D landmarks with PnP.
         Returns (21,3) points in the camera frame at MediaPipe's default hand scale, or None."""
-        raw = det_to_raw(h.px, slot, self.det_size)
+        raw = self.src.det_to_raw(h.px, slot, self.det_size)
         rays = self.cam[slot].unproject(raw)
         if (rays[:, 2] < 0.2).any():
             return None

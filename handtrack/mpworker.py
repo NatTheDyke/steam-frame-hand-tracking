@@ -45,11 +45,12 @@ def init_mercury():
     """Lazily load Monado Mercury's keypoint model (license UNVERIFIED: local measurement only)."""
     global _merc
     if _merc is None:
+        from handtrack import source as camsource
         from handtrack.calib import Rig
         from handtrack.mercury_kp import MercuryKeypoint
-        from handtrack.palm import SLOT_CAM
+        src = camsource.active()          # HANDTRACK_SOURCE, inherited from live.py
         _merc = MercuryKeypoint(os.path.expanduser("~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"),
-                                Rig(), SLOT_CAM, 640, **_merc_config)
+                                Rig(), src.slot_cams, 640, source=src, **_merc_config)
     return _merc
 
 

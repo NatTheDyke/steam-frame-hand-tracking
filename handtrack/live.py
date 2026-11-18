@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Live optical hand detection on the Steam Frame passthrough cameras.
+"""Live optical hand detection on the Steam Frame cameras.
 
-Frames come from `ptgrab stream` via /dev/shm/mrhand-pt (luma, 2464x2464 per
-camera, sensors mounted rotated ±90°).  Each camera gets its own MediaPipe
-HandLandmarker in VIDEO mode.
+--source passthrough (default): `ptgrab stream` -> /dev/shm/mrhand-pt (passthrough luma, 2464x2464
+per camera, sensors mounted rotated ±90°; paused by XRService when room view is off, i.e. in games).
+--source slam: `slamgrab` -> /dev/shm/mrhand-slam (lower tracking cameras, 1056x1024 fisheye, 30 Hz;
+running in games too).  handtrack/source.py turns either into square upright detector images.
+Each camera gets its own MediaPipe HandLandmarker in VIDEO mode.
 
 Debug view: MJPEG on 127.0.0.1:8765 (camera imagery never leaves the headset
 unless you tunnel it):  ssh -L 8765:127.0.0.1:8765 frame   then open
@@ -46,6 +48,7 @@ import numpy as np  # noqa: E402
 
 cv2.setNumThreads(1)
 
+from handtrack import source as camsource
 from handtrack.calib import triangulate
 from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
@@ -304,6 +307,9 @@ class Viewer:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", type=int, default=640, help="detector input size (square)")
+    ap.add_argument("--source", choices=sorted(camsource.SOURCES), default=os.environ.get(camsource.ENV, "passthrough"),
+                    help="camera source: passthrough (ptgrab, room view only) or slam (slamgrab, tracking "
+                         "cameras, works in games); default passthrough or $HANDTRACK_SOURCE")
     ap.add_argument("--no-http", action="store_true")
     ap.add_argument("--gpu", action="store_true", help="MediaPipe GPU delegate (shares the GPU with the compositor)")
     ap.add_argument("--max-hz", type=float, default=7.0,
@@ -394,7 +400,12 @@ def main():
             print("uclamp: not applied (%s)" % e, file=sys.stderr, flush=True)
     thermal = ThermalGuard()
     tel = Telemetry(a.telemetry) if a.telemetry else None
-    shm = PtShm()
+    # the source must be set in the environment before any worker process is spawned
+    os.environ[camsource.ENV] = a.source
+    src = camsource.active()
+    shm = PtShm(src.shm)
+    print("camera source: %s (%s, %dx%d published, %.0f Hz)" % (src.name, src.shm, shm.w, shm.h, 1e9 / src.period_ns),
+          file=sys.stderr, flush=True)
     # MediaPipe's own handedness labels are correct for these cameras (user test 2026-10-10:
     # inverting them swapped the hands), so keep them as-is (mirrored=True = no inversion).
     # MediaPipe runs in its own process (handtrack/mpworker.py) so it can never stall the 60 Hz loop
@@ -410,7 +421,7 @@ def main():
         print("debug view: ssh -L 8765:127.0.0.1:8765 frame  ->  http://localhost:8765", file=sys.stderr)
     logf = open(a.log, "a") if a.log else None
 
-    palm = PalmTracker(a.size) if not a.no_bridge or a.backend == "mercury" else None
+    palm = PalmTracker(a.size, source=src) if not a.no_bridge or a.backend == "mercury" else None
     mt = None
     merc_pool = None
     if a.backend == "mercury":
@@ -447,10 +458,9 @@ def main():
     pool = ThreadPoolExecutor(2)
 
     def prep(cam, img, t_ns):
-        # ptgrab normally delivers frames already downscaled on the GPU; otherwise shrink here
-        if img.shape[0] != a.size:
-            img = cv2.resize(img, (a.size, a.size), interpolation=cv2.INTER_AREA)
-        small = cv2.rotate(img, ROTATE[cam])
+        # ptgrab normally delivers frames already downscaled on the GPU; source.det_image crops,
+        # shrinks and rotates as needed
+        small = src.det_image(img, cam, a.size)
         td = time.perf_counter()
         hands = dets[cam].detect(small, t_ns / 1e9)
         return small, hands, time.perf_counter() - td
@@ -532,7 +542,7 @@ def main():
         slow_cam_q = {"left": {}, "right": {}}   # side -> slot -> (t, quat, backend) latest orientation per camera
         slow_src = {}        # side -> backend of the latest articulated observation ("merc" / "mp")
         last_sent = {}       # side -> (t, position) last sent to the PC
-        grid_t, grid_period = None, 1e9 / 60.0                       # camera frame grid (ns)
+        grid_t, grid_period = None, src.period_ns                    # camera frame grid (ns)
         rot_pending = {}     # side -> (t, quat) orientation outlier awaiting confirmation
         shown = {0: None, 1: None}
         job = None           # (future, kind, slot, imgs_at_detection, t_cap)
@@ -705,10 +715,10 @@ def main():
                 resid = t_raw - pred
                 grid_t = pred + 0.05 * resid                       # follow phase slowly
                 grid_period += 0.002 * resid / nfr                 # and the true frame period
-                grid_period = min(max(grid_period, 15.0e6), 18.5e6)
+                grid_period = min(max(grid_period, 0.9 * src.period_ns), 1.11 * src.period_ns)
             t_cap = int(grid_t)
             t_s = t_cap / 1e9
-            imgs = {0: cv2.rotate(r0[2], ROTATE[0]), 1: cv2.rotate(r1[2], ROTATE[1])}
+            imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
 
             # ---- fast path: position every camera frame (every other frame when hot)
             tf = time.perf_counter()

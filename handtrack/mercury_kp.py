@@ -112,10 +112,15 @@ def make_instructions(joints_m, flip, expand=EXPAND, twist=0.0):
 # ---------------------------------------------------------------- model wrapper
 class MercuryKeypoint:
     def __init__(self, model_path, rig, slot_cams, det_size, raw_size=2464, threads=1,
-                 backend=None, inference="cpu", framenpu_jobs=None):
+                 backend=None, inference="cpu", framenpu_jobs=None, source=None):
         from handtrack.inference import make_backend
         self.backend = backend if backend is not None else make_backend(
             model_path, threads, inference, framenpu_jobs)
+        # source (handtrack/source.py) overrides slot_cams / raw_size and supplies the raw <-> det
+        # mapping; without it the original passthrough geometry is used.
+        self.src = source
+        if source is not None:
+            slot_cams = source.slot_cams
         self.cam = {s: rig.cams[n] for s, n in slot_cams.items()}
         self.det_size, self.raw_size = det_size, raw_size
         g = (np.arange(WSIZE, dtype=np.float32))
@@ -123,6 +128,8 @@ class MercuryKeypoint:
 
     # det image (rotated, det_size square) <-> raw calibrated pixels
     def raw_to_det(self, raw, slot):
+        if self.src is not None:
+            return self.src.raw_to_det(raw, slot, self.det_size)
         k = self.raw_size / self.det_size
         x = (raw[..., 0] + 0.5) / k - 0.5
         y = (raw[..., 1] + 0.5) / k - 0.5
