@@ -98,6 +98,15 @@ columns 21..24 record the submit path, capture sequence and the pair's read and
 optical-flow-done times; FrameNPU's `tools/mercury_live_report.py` turns them
 into per-stage request ages.
 
+`--uclamp-max N` (or `HANDTRACK_UCLAMP_MAX`, 0..1024, off by default) caps the
+CPU frequency the tracker and its workers request through Linux uclamp; workers
+inherit it. On the Frame, Valve's XRService, vrserver and compositor share
+cores 0-4 and keep that cluster at its top frequency, so the cap only takes
+effect on a cluster the tracker has mostly to itself. Short live trials of
+`HANDTRACK_CPUS=5-6` with `--uclamp-max 512` lowered the hottest core peaks by
+about 10 C versus the default 0-4 placement; see FrameNPU `docs/MERCURY_LIVE.md`.
+This is not yet the default.
+
 Shutdown waits for the active job, releases power,
 retires the image and restores the borrowed arena. The worker also registers a
 multiprocessing finalizer. The stop script lets the parent perform that cleanup

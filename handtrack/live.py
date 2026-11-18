@@ -347,6 +347,9 @@ def main():
                     help="submit Mercury right after optical flow (before MediaPipe handling); collect finished jobs "
                          "between camera frames and submit then only if the newest frame became ready less than a "
                          "third of a frame period ago, else wait for the next frame")
+    ap.add_argument("--uclamp-max", type=int, default=os.environ.get("HANDTRACK_UCLAMP_MAX") or None,
+                    help="cap the CPU frequency this tracker and its workers request (Linux uclamp, 0..1024; "
+                         "512 ~ 2 GHz on the big cores); default: no cap (or HANDTRACK_UCLAMP_MAX)")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
                     help="batch: all tracked hands in one Mercury job, published together (original); "
                          "perhand: one hand per job on the newest frame, published as soon as it is done")
@@ -381,6 +384,14 @@ def main():
         os.nice(10)
     except (AttributeError, OSError):
         pass
+    if a.uclamp_max is not None:
+        # before any worker pool exists, so MediaPipe / Mercury workers inherit the clamp
+        from handtrack import uclamp
+        try:
+            n = uclamp.set_process_max(int(a.uclamp_max))
+            print("uclamp: max %d on %d thread(s)" % (int(a.uclamp_max), n), file=sys.stderr, flush=True)
+        except (OSError, ValueError) as e:
+            print("uclamp: not applied (%s)" % e, file=sys.stderr, flush=True)
     thermal = ThermalGuard()
     tel = Telemetry(a.telemetry) if a.telemetry else None
     shm = PtShm()

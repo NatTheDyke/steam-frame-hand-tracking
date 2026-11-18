@@ -280,6 +280,29 @@ class AdmissionTests(unittest.TestCase):
         self.assertLess(releases[0], 0.3 + STALL_S + IDLE_S + 0.01)
 
 
+@unittest.skipUnless(sys.platform == "linux" and os.path.exists("/proc/self/sched"), "Linux only")
+class UclampTests(unittest.TestCase):
+    def test_clamp_applies_to_threads_and_is_inherited(self):
+        import subprocess
+        from handtrack import uclamp
+        if uclamp.current_max() is None:
+            self.skipTest("kernel without uclamp reporting")
+        root = str(Path(__file__).resolve().parents[1])
+        child = "from handtrack import uclamp; print(uclamp.current_max())"
+        parent = ("import subprocess, sys, threading; from handtrack import uclamp; "
+                  "threading.Thread(target=lambda: None).start(); uclamp.set_process_max(512); "
+                  "print(uclamp.current_max()); "
+                  "print(subprocess.run([sys.executable, '-c', %r], capture_output=True, text=True).stdout.strip())"
+                  % child)
+        out = subprocess.run([sys.executable, "-c", parent], capture_output=True, text=True,
+                             env=dict(os.environ, PYTHONPATH=root))
+        if out.returncode and "Operation not permitted" in out.stderr:
+            self.skipTest("uclamp not permitted here")
+        self.assertEqual(out.stdout.split(), ["512", "512"], out.stderr)
+        with self.assertRaises(ValueError):
+            uclamp.set_process_max(2000)
+
+
 @unittest.skipUnless(os.environ.get("FNPU_MERCURY_MODEL"), "pinned local model required")
 class GeometryParityTests(unittest.TestCase):
     def test_batch_preserves_crop_decode_and_observation_order(self):
