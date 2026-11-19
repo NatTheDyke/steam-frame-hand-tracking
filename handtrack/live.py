@@ -70,6 +70,7 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 #   curl_filter   = <min_cutoff> <beta> | off   finger curls One Euro
 #   pos_filter    = <min_cutoff> <beta> | off   sent position One Euro (fast path)
 #   rot_glide_ms  = <ms>  (0 = off)             exponential glide toward the newest orientation
+#   merc_crop     = raw | det | auto            Mercury crop source (default: the --merc-crop option)
 #   send_offset_ms = <ms> (default 0)           shift the capture time sent to the PC driver, which picks the
 #                                               head pose for placing the hand in the world by that time
 #                                               (diagnostic for hands that move with the head)
@@ -77,7 +78,7 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 # it moves (orientation lag ~130 vs ~160 ms, same still-hand jitter).  The previous smooth profile is
 # tools/profile_smooth_v1.conf (copy it to ~/.config/mrhand/profile to go back).
 PROFILE_DEFAULTS = {"axis_filter": (0.4, 1.2), "centre_filter": (1.5, 0.6), "curl_filter": (1.0, 1.0),
-                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0}
+                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0, "merc_crop": None}
 
 
 class Profile:
@@ -96,6 +97,8 @@ class Profile:
                 continue
             if k in ("rot_glide_ms", "send_offset_ms"):
                 v[k] = float(val)
+            elif k == "merc_crop":
+                v[k] = val if val in ("raw", "det", "auto") else None
             elif val == "off":
                 v[k] = None
             else:
@@ -341,6 +344,9 @@ def main():
     ap.add_argument("--merc-stereo-ms", type=float, default=40.0,
                     help="max capture-time gap (ms) for triangulating two Mercury views; 0 = only the same capture "
                          "(views from different times describe different hand poses when the hand moves)")
+    ap.add_argument("--merc-crop", choices=("auto", "raw", "det"), default="auto",
+                    help="Mercury crop source: the full-resolution camera frame (raw) or the detector image "
+                         "(det); auto = raw when the published frame is larger than --size (tracking cameras)")
     ap.add_argument("--curl-latest", action="store_true",
                     help="finger curls from the newest observation only (no blend with older views of other cameras)")
     ap.add_argument("--merc-hint-reset", action="store_true",
@@ -411,6 +417,13 @@ def main():
     shm = PtShm(src.shm)
     print("camera source: %s (%s, %dx%d published, %.0f Hz)" % (src.name, src.shm, shm.w, shm.h, 1e9 / src.period_ns),
           file=sys.stderr, flush=True)
+    # Mercury crops from the full-resolution camera frame when the detector image is a downscale of it
+    def crop_is_raw(mode):
+        return mode == "raw" or (mode == "auto" and shm.w > a.size)
+    merc_raw = crop_is_raw(a.merc_crop)
+    if a.backend == "mercury":
+        print("mercury crop source: %s" % ("camera frame %dx%d" % (shm.w, shm.h) if merc_raw else
+                                           "detector image %d" % a.size), file=sys.stderr, flush=True)
     # MediaPipe's own handedness labels are correct for these cameras (user test 2026-10-10:
     # inverting them swapped the hands), so keep them as-is (mirrored=True = no inversion).
     # MediaPipe runs in its own process (handtrack/mpworker.py) so it can never stall the 60 Hz loop
@@ -671,7 +684,7 @@ def main():
             fp_ = {sd: v for sd, v in fast_pos.items()
                    if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
             info = dict(frame_t, path=path or ("early" if between_frames else "frame"), seq=adm.seq)
-            if mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_, info=info):
+            if mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_, info=info, raw_imgs=raw_frames):
                 adm.submitted(now)
                 next_merc = now + iv
             else:
@@ -698,6 +711,7 @@ def main():
                     pos_filt[sd].set(pv["pos_filter"])
                 rot_tau = (a.rot_smooth_ms if pv["rot_glide_ms"] is None else pv["rot_glide_ms"]) / 1000.0
                 send_off_ns = int(pv["send_offset_ms"] * 1e6)
+                merc_raw = crop_is_raw(pv["merc_crop"] or a.merc_crop)
                 if tel is not None:   # profile switch marker: the report can split results by profile
                     tel.write("P,%d,%s" % (time.monotonic_ns(), ";".join(
                         "%s=%s" % (k, "off" if v is None else (v if not isinstance(v, tuple) else "%g/%g" % v))
@@ -754,6 +768,7 @@ def main():
             t_cap = int(grid_t)
             t_s = t_cap / 1e9
             imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
+            raw_frames = {0: r0[2], 1: r1[2]} if merc_raw else None
 
             # ---- fast path: position every camera frame (every other frame when hot)
             tf = time.perf_counter()

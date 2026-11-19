@@ -1,5 +1,6 @@
 """Camera-source geometry (handtrack/source.py): passthrough must match the original formulas exactly,
 slam (arbitrary-angle rotation, non-square sensor) must be self-consistent with its images."""
+import math
 from pathlib import Path
 import sys
 import unittest
@@ -104,6 +105,38 @@ class ActiveSource(unittest.TestCase):
                 os.environ.pop(camsource.ENV, None)
             else:
                 os.environ[camsource.ENV] = old
+
+
+class MercuryRawCrop(unittest.TestCase):
+    """Mercury may crop from the published camera frame instead of the detector image: same scene,
+    same place (the raw crop is only sharper)."""
+
+    def test_raw_crop_matches_detector_crop(self):
+        try:
+            from handtrack.calib import Rig
+            rig = Rig()
+        except Exception as e:                       # calibration lives on the headset
+            self.skipTest("no calibration: %r" % (e,))
+        from handtrack.mercury_kp import MercuryKeypoint, q_mul
+        mk = MercuryKeypoint(None, rig, SLAM.slot_cams, S, backend=object(), source=SLAM)
+        rng = np.random.default_rng(5)
+        raw = np.zeros((1024, 1056), np.float32)
+        for _ in range(60):                          # smooth blobs: downscaling loses nothing here
+            cv2.circle(raw, (int(rng.uniform(100, 956)), int(rng.uniform(100, 924))), int(rng.uniform(25, 70)),
+                       float(rng.uniform(60, 255)), -1)
+        raw = cv2.GaussianBlur(raw, (0, 0), 12).astype(np.uint8)
+        half = np.radians(20) / 2
+        for slot in (0, 1):
+            det = SLAM.det_image(raw, slot, S)
+            for q in ((1.0, 0.0, 0.0, 0.0), (math.cos(half), math.sin(half), 0.0, 0.0),
+                      q_mul((math.cos(half), 0.0, math.sin(half), 0.0), (math.cos(half), math.sin(half), 0.0, 0.0))):
+                q = np.array(q)
+                for flip in (False, True):
+                    a = mk.crop(slot, det, q, 0.12, flip).astype(float)
+                    b = mk.crop(slot, raw, q, 0.12, flip, raw=True).astype(float)
+                    self.assertGreater(a.std(), 5)
+                    self.assertGreater(np.corrcoef(a.ravel(), b.ravel())[0, 1], 0.99, (slot, q, flip))
+                    self.assertLess(np.abs(a - b).mean(), 3.0, (slot, q, flip))
 
 
 if __name__ == "__main__":

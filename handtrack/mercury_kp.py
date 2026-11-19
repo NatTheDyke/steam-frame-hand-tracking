@@ -138,16 +138,24 @@ class MercuryKeypoint:
             return np.stack([S - 1 - y, x], -1)
         return np.stack([y, S - 1 - x], -1)   # rotated CCW
 
-    def crop(self, slot, det_img, q, r, flip):
+    def crop(self, slot, det_img, q, r, flip, raw=False):
+        """128x128 crop.  det_img is the det_size detector image, or with raw=True the camera frame
+        as published in the shm (unrotated, raw aspect, any scale): sampling the full-resolution
+        frame keeps detail for small (distant) hands that the detector image has already lost."""
         sx = (-r + 2 * r * self.gx / WSIZE) if not flip else (r - 2 * r * self.gx / WSIZE)
         sy = r - 2 * r * self.gy / WSIZE
         d = np.stack([2 * sx, 2 * sy, sx * sx + sy * sy - 1], -1).reshape(-1, 3)
         d = q_rot(q, d)
         d[:, 1] *= -1           # Mercury -> OpenCV camera frame
         d[:, 2] *= -1
-        raw = self.cam[slot].project(d).reshape(WSIZE, WSIZE, 2)
-        det = self.raw_to_det(raw, slot).astype(np.float32)
-        return cv2.remap(det_img, det[..., 0], det[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        px = self.cam[slot].project(d).reshape(WSIZE, WSIZE, 2)
+        if raw:
+            raw_w = self.src.raw_w if self.src is not None else self.raw_size
+            f = det_img.shape[1] / raw_w                       # published pixels per raw pixel
+            m = ((px + 0.5) * f - 0.5).astype(np.float32)
+        else:
+            m = self.raw_to_det(px, slot).astype(np.float32)
+        return cv2.remap(det_img, m[..., 0], m[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
 
     @staticmethod
     def normalise(img):
@@ -187,10 +195,10 @@ class MercuryKeypoint:
     def close(self):
         self.backend.close()
 
-    def _prepare(self, slot, det_img, joints_cv, flip, use_hint=True, expand=None):
+    def _prepare(self, slot, det_img, joints_cv, flip, use_hint=True, expand=None, raw=False):
         jm = joints_cv * np.array([1, -1, -1])
         q, r, kp, _ = make_instructions(jm, flip, expand=EXPAND if expand is None else expand)
-        img = self.crop(slot, det_img, q, r, flip)
+        img = self.crop(slot, det_img, q, r, flip, raw=raw)
         x = self.normalise(img)
         if x is None:
             return None

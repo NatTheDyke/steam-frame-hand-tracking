@@ -89,12 +89,13 @@ class MercuryTracker:
         if self.job is None and self.idle_future is None:
             self.idle_future = self.pool.submit(self.worker.idle_mercury)
 
-    def submit(self, imgs, t_cap_ns, fast_pos, anchor_pos=None, info=None):
+    def submit(self, imgs, t_cap_ns, fast_pos, anchor_pos=None, info=None, raw_imgs=None):
         """One Mercury crop per tracked hand on this frame (alternating cameras); in "perhand" mode
         only the least recently serviced hand.  fast_pos places the crop (its image location is right
         even when its depth is held); anchor_pos (default fast_pos) is the depth anchor for single-view
         joints and should only contain trustworthy (two-camera) positions.  info (path, seq, t_read,
-        t_ready) is copied into this job's telemetry records."""
+        t_ready) is copied into this job's telemetry records.  raw_imgs (the published camera frames):
+        Mercury crops from these at full resolution; imgs (detector images) still seed the flow."""
         if self.job is not None or not self.hands:
             return False
         jobs = []
@@ -137,7 +138,11 @@ class MercuryTracker:
             return False
         self.idle_future = None
         used = sorted({j[0] for j in jobs})
-        self.job = (self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used}), t_cap_ns, fast_pos,
+        if raw_imgs is not None:
+            fut = self.pool.submit(self.worker.run_mercury, jobs, {s: raw_imgs[s] for s in used}, True)
+        else:
+            fut = self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used})
+        self.job = (fut, t_cap_ns, fast_pos,
                     {s: imgs[s] for s in used}, time.monotonic_ns(), len(jobs))
         if anchor_pos is not None:
             self.job = self.job[:2] + (anchor_pos,) + self.job[3:]

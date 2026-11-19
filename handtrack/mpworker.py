@@ -92,8 +92,9 @@ def _schedstat():
         return 0, 0
 
 
-def run_mercury(jobs, imgs):
-    """jobs: [(slot, side, joints_cv (21,3))]; ROI from those joints, same images MediaPipe saw.
+def run_mercury(jobs, imgs, raw=False):
+    """jobs: [(slot, side, joints_cv (21,3))]; ROI from those joints, same images MediaPipe saw
+    (raw=True: imgs are the published camera frames, sampled at full resolution).
     Returns [(slot, side, result-without-crop or None, seconds, timing)] where timing =
     {t0, t1: CLOCK_MONOTONIC ns around this crop (same clock as the tracker), cpu_ns: thread CPU
     time, wait_ns: runqueue wait (schedstat) during the crop group}."""
@@ -104,7 +105,7 @@ def run_mercury(jobs, imgs):
         group = jobs[start:start + 3]
         observations = [dict(slot=j[0], det_img=imgs[j[0]], joints_cv=j[2],
                              flip=(j[1] == "right"), expand=j[3] if len(j) > 3 else None,
-                             use_hint=j[4] if len(j) > 4 else True) for j in group]
+                             use_hint=j[4] if len(j) > 4 else True, raw=raw) for j in group]
         s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
         results = mk.run_many(observations)
         dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
