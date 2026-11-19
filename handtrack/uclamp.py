@@ -32,10 +32,14 @@ def set_process_max(value):
     """Clamp every current thread of this process (new threads and children inherit it)."""
     if not 0 <= value <= 1024:
         raise ValueError("uclamp max must be 0..1024")
-    tids = [int(t) for t in os.listdir("/proc/self/task")]
-    for tid in tids:
-        _set(tid, value)
-    return len(tids)
+    n = 0
+    for tid in [int(t) for t in os.listdir("/proc/self/task")]:
+        try:
+            _set(tid, value)
+            n += 1
+        except ProcessLookupError:
+            pass                      # thread exited after the listing: nothing left to clamp
+    return n
 
 
 def current_max(pid="self"):
