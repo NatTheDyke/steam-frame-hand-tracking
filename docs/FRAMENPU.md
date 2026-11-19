@@ -48,10 +48,36 @@ sudo env HOME="$HOME" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
   --merc-inference framenpu --framenpu-jobs "$HOME/handtrack/framenpu-jobs"
 ```
 
-The normal unprivileged launcher can also pass these flags, but without device
+Prefer the NPU service below. The normal unprivileged launcher can also pass these flags, but without device
 access the worker logs the reason and uses CPU. There is no automatic elevation.
 Mercury shadow comparisons in the MediaPipe worker continue to use CPU; a
 separate process must not contend for the same DSP session.
+
+## The NPU service (recommended on the headset)
+
+Running the whole tracker as root breaks the panel, the start/stop scripts and the thermal
+watchdog (they cannot see or stop a root process), and runs user-writable code as root. Instead,
+`handtrack/npuservice.py` runs as a small root systemd service that owns the FrameNPU session, and
+the tracker stays an ordinary user process:
+
+```sh
+sudo headset/install_npu_service.sh /path/to/framenpu-0.1.0-py3-none-any.whl [~/handtrack/framenpu-jobs]
+echo "... --merc-inference service" > ~/handtrack/start_args   # see headset/start_args
+```
+
+- Everything the service runs or reads is a root-owned copy in `/var/lib/mrhand-npu`: its own
+  venv (system Python, numpy copied from the tracker venv, the FrameNPU wheel), the service
+  script, the pinned Mercury model and the qualified job image. The installer checks the model
+  and image hashes; FrameNPU checks them again.
+- The socket `/run/mrhand-npu/npu.sock` is mode 0600, owned by the tracking user, and the service
+  also checks the peer's uid. Requests are a JSON header plus float32 arrays of fixed shapes
+  (no pickle), one to three crops.
+- One client at a time; a second tracker is told "busy" and uses CPU. The session opens on the
+  first request (about 0.15 s) and closes when the tracker disconnects, so a stopped tracker
+  leaves the DSP as before. A FrameNPU error closes the session; the tracker latches to CPU.
+- Measured on the Frame: one crop 9.5 ms round trip (p95 10.0 ms, 5.0 ms DSP body), two crops
+  19 ms, three 26 ms.
+- `sudo headset/uninstall_npu_service.sh` removes the unit and `/var/lib/mrhand-npu`.
 
 ## Submit the observations that exist
 

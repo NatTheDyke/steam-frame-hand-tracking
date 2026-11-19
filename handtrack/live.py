@@ -328,8 +328,11 @@ def main():
     ap.add_argument("--idle-hz", type=float, default=5.0, help="detection rate while no hand has been seen for 1 s")
     ap.add_argument("--backend", choices=("mediapipe", "mercury"), default="mediapipe",
                     help="mercury: MediaPipe only discovers hands; Mercury keypoints track them continuously")
-    ap.add_argument("--merc-inference", choices=("cpu", "framenpu"), default="cpu",
-                    help="Mercury inference (default CPU); FrameNPU failures fall back to CPU")
+    ap.add_argument("--merc-inference", choices=("cpu", "framenpu", "service"), default="cpu",
+                    help="Mercury inference (default CPU). framenpu: FrameNPU in this process (root); "
+                         "service: FrameNPU through the NPU service (headset/install_npu_service.sh), the "
+                         "tracker runs as the user. FrameNPU failures fall back to CPU")
+    ap.add_argument("--npu-socket", help="NPU service socket (default /run/mrhand-npu/npu.sock)")
     ap.add_argument("--framenpu-jobs", type=os.path.expanduser,
                     help="qualified FrameNPU replay build directory (link.json, image and loader)")
     ap.add_argument("--curl-source", choices=("mercury", "geometric"), default="mercury",
@@ -447,7 +450,7 @@ def main():
         from handtrack.merctrack import MercuryTracker
         merc_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
                                         initializer=mpworker.init_mercury_proc,
-                                        initargs=(a.merc_inference, a.framenpu_jobs))
+                                        initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket))
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched

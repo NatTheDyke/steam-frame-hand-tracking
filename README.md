@@ -56,6 +56,9 @@ positions in both cameras, against 351/400 for passthrough).
 Mercury tracking can use a pluggable FrameNPU inference backend with automatic
 CPU fallback. CPU remains the default. Available crops are submitted immediately
 in groups of one to three; the worker never waits for a third crop.
+On the headset it runs through a small root service (`sudo headset/install_npu_service.sh`), so
+the tracker itself stays a normal user process; `headset/start_args` selects it with
+`--merc-inference service` and falls back to CPU when the service is not installed.
 Setup, selection and validation: [docs/FRAMENPU.md](docs/FRAMENPU.md).
 
 ## The panel

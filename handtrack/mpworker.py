@@ -54,7 +54,7 @@ def init_mercury():
     return _merc
 
 
-def init_mercury_proc(inference="cpu", framenpu_jobs=None):
+def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None):
     """Initializer for the dedicated Mercury worker process (no MediaPipe in it)."""
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(v, "1")
@@ -64,7 +64,7 @@ def init_mercury_proc(inference="cpu", framenpu_jobs=None):
     except (AttributeError, OSError):
         pass
     global _merc_config
-    _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs)
+    _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs, npu_socket=npu_socket)
     init_mercury()
     from multiprocessing.util import Finalize
     Finalize(None, close_mercury, exitpriority=10)

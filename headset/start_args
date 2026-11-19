@@ -1,1 +1,1 @@
---backend mercury --merc-early --flow-v2 --source slam --blend-ms 0
+--backend mercury --merc-early --flow-v2 --source slam --blend-ms 0 --merc-inference service

@@ -55,6 +55,29 @@ class FrameNPUBackend:
         self.session.close()
 
 
+class ServiceBackend:
+    """FrameNPU through the privileged NPU service (handtrack/npuservice.py), so the tracker itself
+    runs as the user. The service owns the DSP session; this process only sends normalized crops."""
+    name = "framenpu"
+
+    def __init__(self, socket_path=None):
+        from handtrack.npuservice import SOCKET, Client
+        self.client = Client(socket_path or SOCKET)
+
+    @property
+    def last_timing(self):
+        return self.client.last_timing
+
+    def infer(self, feeds):
+        return self.client.infer(feeds)
+
+    def idle(self):
+        self.client.idle()
+
+    def close(self):
+        self.client.close()
+
+
 class FallbackBackend:
     """Latch an accelerator failure to CPU for this worker's remaining lifetime.
 
@@ -120,10 +143,13 @@ class FallbackBackend:
             self.cpu.close()
 
 
-def make_backend(model_path, threads=1, inference="cpu", framenpu_jobs=None):
-    if inference not in ("cpu", "framenpu"):
+def make_backend(model_path, threads=1, inference="cpu", framenpu_jobs=None, npu_socket=None):
+    """inference: cpu | framenpu (in-process, needs root) | service (the NPU service, as the user)."""
+    if inference not in ("cpu", "framenpu", "service"):
         raise ValueError("unknown Mercury inference backend: " + inference)
     cpu = CPUBackend(model_path, threads)
     if inference == "cpu":
         return cpu
+    if inference == "service":
+        return FallbackBackend(cpu, lambda: ServiceBackend(npu_socket))
     return FallbackBackend(cpu, lambda: FrameNPUBackend(model_path, framenpu_jobs))
