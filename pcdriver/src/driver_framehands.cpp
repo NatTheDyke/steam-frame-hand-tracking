@@ -306,7 +306,7 @@ struct Shared {
 // ---------------------------------------------------------------- statistics
 struct Stats {
     std::vector<double> presentAgeMs, sampleGapMs;
-    uint64_t samples = 0, presents = 0, extrap = 0, interp = 0, held = 0, hmdMiss = 0;
+    uint64_t samples = 0, presents = 0, extrap = 0, interp = 0, held = 0, hmdMiss = 0, curlUpdates = 0;
     void clear() { *this = Stats(); }
 };
 static double pctl(std::vector<double> v, double p) {
@@ -464,7 +464,14 @@ public:
         if (!samples_.empty()) {
             const Sample &l = samples_.back();
             if (qdot(wq, l.q) < 0) wq = {-wq.w, -wq.x, -wq.y, -wq.z};
-            if (tCapPc <= l.t) return;   // duplicate / out of order
+            if (tCapPc == l.t) {
+                // same frame re-sent with newer finger curls (the tracker sends one when a Mercury
+                // result arrives between camera frames): the pose is unchanged, take the curls only
+                curls_ = {h.curl[0], h.curl[1], h.curl[2], h.curl[3], h.curl[4]};
+                st.curlUpdates++;
+                return;
+            }
+            if (tCapPc < l.t) return;    // out of order
             st.sampleGapMs.push_back((tCapPc - l.t) / 1e6);
         }
         filterPosition(wp, tCapPc, c);
@@ -822,11 +829,11 @@ public:
                 if (s.presents || s.samples)
                     Log("framehands stats %s: samples %.1f/s (gap ms p50 %.1f p95 %.1f), presents %.1f/s "
                         "(interp %llu extrap %llu held %llu), newest-sample age at present ms p50 %.1f p95 %.1f p99 %.1f, "
-                        "hmd-history misses %llu",
+                        "hmd-history misses %llu, curl-only updates %.1f/s",
                         i ? "right" : "left", s.samples / dt, pctl(s.sampleGapMs, 50), pctl(s.sampleGapMs, 95),
                         s.presents / dt, (unsigned long long)s.interp, (unsigned long long)s.extrap,
                         (unsigned long long)s.held, pctl(s.presentAgeMs, 50), pctl(s.presentAgeMs, 95),
-                        pctl(s.presentAgeMs, 99), (unsigned long long)s.hmdMiss);
+                        pctl(s.presentAgeMs, 99), (unsigned long long)s.hmdMiss, s.curlUpdates / dt);
                 s.clear();
             }
         }

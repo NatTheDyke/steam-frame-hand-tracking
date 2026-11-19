@@ -185,6 +185,8 @@ class Telemetry:
       F,t_cap_ns,t_send_ns,side,pos_src,pos_obs_age_ms,q_src,q_age_ms,curl_age_ms,npts0,npts1,x,y,z,qw,qx,qy,qz
       pos_src: stereo | mono_ray0/1 (flow in one camera, depth held) | hold (frozen) | mediapipe
       *_age_ms: t_send minus the capture time of the image the component was measured on
+    U rows (curl-only re-send of the last frame packet when a Mercury result arrives between frames):
+      U,t_cap_ns,t_send_ns,side,curl_age_ms
     M rows (one per camera per MediaPipe run):
       M,t_det_ns,t_done_ns,kind,slot,dur_ms,nhands
     Z rows (held Mercury inference power released after admission was blocked, see mercsched.py):
@@ -545,6 +547,7 @@ def main():
         slow_cam_q = {"left": {}, "right": {}}   # side -> slot -> (t, quat, backend) latest orientation per camera
         slow_src = {}        # side -> backend of the latest articulated observation ("merc" / "mp")
         last_sent = {}       # side -> (t, position) last sent to the PC
+        last_pkt = [None]    # (poses, ages, t_cap sent) of the last frame packet (curl-only re-sends)
         grid_t, grid_period = None, src.period_ns                    # camera frame grid (ns)
         rot_pending = {}     # side -> (t, quat) orientation outlier awaiting confirmation
         shown = {0: None, 1: None}
@@ -562,6 +565,31 @@ def main():
             merc_collect()
             merc_admit(between_frames, path)
             merc_power()
+
+        def send_curl_update(sides):
+            """A Mercury result collected between camera frames: re-send the last frame's packet with
+            the new finger curls now instead of with the next frame (~half a frame period sooner).
+            Same capture time and pose, so the PC driver (v4 with curl-only updates) takes only the
+            curls; older drivers drop it as a duplicate."""
+            if not bridge or last_pkt[0] is None or not sides:
+                return
+            poses_, ages_, tc_ = last_pkt[0]
+            out = dict(poses_)
+            changed = []
+            for sd in sides:
+                p_, sp_ = out.get(sd), slow.get(sd)
+                if p_ is None or sp_ is None or len(sp_) < 5:
+                    continue
+                out[sd] = tuple(p_[:4]) + (sp_[4],)
+                changed.append(sd)
+            if not changed:
+                return
+            bridge.send(out, tc_, ages_)
+            last_pkt[0] = (out, ages_, tc_)
+            if tel is not None:
+                t_send = time.monotonic_ns()
+                for sd in changed:
+                    tel.write("U,%d,%d,%s,%.1f" % (tc_, t_send, sd, (t_send / 1e9 - slow_t[sd]) * 1e3))
 
         def merc_power():
             """Release held inference power once admission has been blocked for a while."""
@@ -695,8 +723,10 @@ def main():
                     # On stalled cameras a finished job is always collected so held power can be released.
                     early = a.merc_early or a.merc_fresh
                     if mt.job is not None and mt.job[0].done() and (early or adm.stalled(time.monotonic())):
+                        before = dict(slow_t)
                         merc_collect()
                         if early:
+                            send_curl_update([sd for sd in slow_t if slow_t[sd] != before.get(sd)])
                             merc_admit(True)
                     merc_power()
                 time.sleep(0.002)
@@ -972,6 +1002,7 @@ def main():
                 ages[side] = ((t_s - pos_t) * 1e3, (t_s - q_t) * 1e3)
             if bridge:
                 bridge.send(poses, t_cap + send_off_ns, ages)
+                last_pkt[0] = (poses, ages, t_cap + send_off_ns)
             if tel is not None and tel_rows:
                 t_send = time.monotonic_ns()
                 for (sd, psrc, pt, qsrc, qt, ct, npts, pp, qq) in tel_rows:
