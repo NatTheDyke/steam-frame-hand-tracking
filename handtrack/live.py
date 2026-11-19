@@ -52,7 +52,7 @@ from handtrack import source as camsource
 from handtrack.calib import triangulate
 from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
-from handtrack.mercsched import Admission
+from handtrack.mercsched import Admission, rate_cap_due
 from handtrack.palm import PALM_IDX, Bridge, OneEuro, PalmTracker
 
 SHM = "/dev/shm/mrhand-pt"
@@ -625,7 +625,7 @@ def main():
             if not mt.tracked() or adm.stalled(now):
                 blocked[0] = "untracked" if not mt.tracked() else "stall"
                 return
-            if now < next_merc:
+            if not rate_cap_due(now, next_merc, grid_period / 1e9):
                 adm.active(now)                     # rate cap: still tracking
                 return
             # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period

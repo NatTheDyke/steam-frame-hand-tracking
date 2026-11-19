@@ -207,6 +207,18 @@ class SchedulerTests(unittest.TestCase):
 class AdmissionTests(unittest.TestCase):
     PERIOD = 1 / 60
 
+    def test_rate_cap_tolerates_frame_jitter(self):
+        from handtrack.mercsched import rate_cap_due
+        period = 1 / 30.0
+        submit = 10.0
+        next_t = submit + 1 / 30.0                 # --merc-hz 30 at a 30 Hz camera
+        # the next frame ready 1 ms "early" (jitter) is still due; half a period early is not
+        self.assertTrue(rate_cap_due(submit + period - 0.001, next_t, period))
+        self.assertFalse(rate_cap_due(submit + period / 2, next_t, period))
+        # 60 Hz cameras with a 30 Hz cap still skip the frame in between
+        self.assertFalse(rate_cap_due(submit + 1 / 60.0, next_t, 1 / 60.0))
+        self.assertTrue(rate_cap_due(submit + 2 / 60.0 - 0.001, next_t, 1 / 60.0))
+
     def test_a_capture_is_submitted_at_most_once(self):
         from handtrack.mercsched import Admission
         adm = Admission()

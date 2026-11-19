@@ -10,6 +10,7 @@ Rules
 - Held power (FrameNPU HMX) is released once admission has been blocked for IDLE_S: no tracked
   hand, stalled cameras, a thermal pause, or no crop that can be placed. Short gaps (rate cap,
   waiting for the next frame, one unplaceable crop) keep it, so power is never cycled per crop.
+- The rate cap tolerates a frame arriving up to a quarter period early (rate_cap_due).
 - fresh=True (--merc-fresh): when the worker frees up between camera frames, submit the newest
   frame only if it became ready less than FRESH_FRACTION of a frame period ago; otherwise wait
   for the next frame. With a busy worker, results arrive every W s and the mean age of the newest
@@ -17,6 +18,19 @@ Rules
   for x s now gives L + x + W + W/2; waiting gives L + W + (W + period - x)/2. Submitting now wins
   only while x < period / 3.
 """
+
+RATE_SLACK_FRACTION = 0.25  # rate cap: a capture may arrive this fraction of a frame period early
+
+
+def rate_cap_due(now, next_t, period_s):
+    """The Mercury rate cap (--merc-hz) allows a new submission at next_t (previous submission + the
+    cap interval).  Camera frames arrive one period apart with ~1 ms jitter, so with the cap equal to
+    the frame rate a frame that became ready slightly early was refused and, as nothing retried it,
+    that cycle was lost: in a live 30 Hz trial 65% of frames were skipped (one result per 67 ms).
+    Allow a frame up to RATE_SLACK_FRACTION of a period early; each capture is still submitted at
+    most once (Admission), so this never runs Mercury faster than the cameras."""
+    return now >= next_t - RATE_SLACK_FRACTION * period_s
+
 
 STALL_S = 0.1             # no new camera pair for this long (6 frames at 60 Hz) = cameras stalled
 IDLE_S = 0.2              # admission blocked this long -> release held power
