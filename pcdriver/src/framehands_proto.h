@@ -37,7 +37,7 @@ struct FhHand {
     float quat[4];        // w, x, y, z: head-from-palm rotation (controller convention: -z along fingers, +y back of hand)
     float ageMs;          // capture -> send (headset clock)
     float curl[5];        // thumb, index, middle, ring, pinky: 0 open .. 1 fully curled
-    float splay[5];       // -1..1 (not computed yet: 0)
+    float splay[5];       // -1..1, thumb first (thumb not computed: 0); 0 unless the tracker runs with --splay
     float posAgeMs;       // v4: tCapNs minus this hand's position observation time (>= 0)
     float rotAgeMs;       // v4: tCapNs minus this hand's orientation observation time (>= 0)
 };

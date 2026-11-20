@@ -367,6 +367,8 @@ def main():
     ap.add_argument("--merc-crop", choices=("auto", "raw", "det"), default="auto",
                     help="Mercury crop source: the full-resolution camera frame (raw) or the detector image "
                          "(det); auto = raw when the published frame is larger than --size (tracking cameras)")
+    ap.add_argument("--splay", action="store_true",
+                    help="send finger splay (sideways spread) computed from the 3D joints (default: 0); older PC drivers ignore it")
     ap.add_argument("--curl-latest", action="store_true",
                     help="finger curls from the newest observation only (no blend with older views of other cameras)")
     ap.add_argument("--merc-hint-reset", action="store_true",
@@ -484,6 +486,8 @@ def main():
             mt.predict_roi, mt.sched),
             file=sys.stderr, flush=True)
     bridge = None if a.no_bridge else Bridge()
+    if bridge is not None:
+        bridge.splay = a.splay
 
     def new_stats():
         return {"frames": 0, "hands": 0, "lat": [], "det": [], "pairs": 0, "palms": 0, "monoerr": [],
@@ -733,6 +737,8 @@ def main():
                         fz_.set(pv["axis_filter"])
                         fx_.set(pv["axis_filter"])
                         palm.curl_filt[sd].set(pv["curl_filter"])
+                    if bridge is not None:
+                        bridge.splay_filt[sd].set(pv["curl_filter"])
                     pos_filt[sd].set(pv["pos_filter"])
                 rot_tau = (a.rot_smooth_ms if pv["rot_glide_ms"] is None else pv["rot_glide_ms"]) / 1000.0
                 send_off_ns = int(pv["send_offset_ms"] * 1e6)

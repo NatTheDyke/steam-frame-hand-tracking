@@ -408,11 +408,16 @@ public:
         for (int k = 0; k < 3; k++) palmT_[k] = centre[k];
     }
 
+    // FhHand splay (-1..1, thumb first; the tracker sends 0 without --splay), clamped
+    static MyFingerSplays splaysFrom(const FhHand &h) {
+        auto c = [](float v) { return std::isfinite(v) ? std::fmax(-1.f, std::fmin(1.f, v)) : 0.f; };
+        return {c(h.splay[0]), c(h.splay[1]), c(h.splay[2]), c(h.splay[3]), c(h.splay[4])};
+    }
+
     void updateSkeleton() {
         if (skeleton_ == k_ulInvalidInputComponentHandle) return;
         VRBoneTransform_t b[eBone_Count];
-        MyFingerSplays splays{};
-        sim_.ComputeSkeletonTransforms(role_, curls_, splays, b);
+        sim_.ComputeSkeletonTransforms(role_, curls_, splays_, b);
         VRDriverInput()->UpdateSkeletonComponent(skeleton_, VRSkeletalMotionRange_WithController, b, eBone_Count);
         VRDriverInput()->UpdateSkeletonComponent(skeleton_, VRSkeletalMotionRange_WithoutController, b, eBone_Count);
     }
@@ -468,6 +473,7 @@ public:
                 // same frame re-sent with newer finger curls (the tracker sends one when a Mercury
                 // result arrives between camera frames): the pose is unchanged, take the curls only
                 curls_ = {h.curl[0], h.curl[1], h.curl[2], h.curl[3], h.curl[4]};
+                splays_ = splaysFrom(h);
                 st.curlUpdates++;
                 return;
             }
@@ -478,6 +484,7 @@ public:
         samples_.push_back({tCapPc, {wp[0], wp[1], wp[2]}, wq});
         while (samples_.size() > 64) samples_.pop_front();
         curls_ = {h.curl[0], h.curl[1], h.curl[2], h.curl[3], h.curl[4]};
+        splays_ = splaysFrom(h);
         st.samples++;
     }
 
@@ -610,6 +617,7 @@ private:
     VRInputComponentHandle_t haptic_ = k_ulInvalidInputComponentHandle;
     MyHandSimulation sim_;
     MyFingerCurls curls_{};
+    MyFingerSplays splays_{};             // 0 unless the tracker runs with --splay
     Quat palmQ_{1, 0, 0, 0};
     double palmT_[3] = {};
     double palmWorld_[3] = {};

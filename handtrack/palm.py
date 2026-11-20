@@ -119,6 +119,38 @@ def finger_curls(W):
     return np.array(out)
 
 
+# ---------------------------------------------------------------- finger splay
+# Sideways angle of each finger's proximal bone in the palm plane, measured from the wrist -> middle
+# MCP line (+ = toward the thumb), relative to a relaxed hand (HOT3D medians), in the units of OpenVR's
+# handskeletonsimulation: splay 1.0 = 15 deg more at the proximal joint than its default fan.
+_SPLAY_BONES = [(5, 6), (9, 10), (13, 14), (17, 18)]
+_SPLAY_REST = np.radians([0.0, -6.0, -13.0, -15.0])
+_SPLAY_UNIT = math.radians(15.0)
+
+
+def finger_splays(P):
+    """P: (21,3) joints -> splays [thumb, index, middle, ring, pinky] in -1..1 (thumb not computed: 0).
+    A finger curled out of the palm plane has no meaningful sideways angle: it fades to 0."""
+    P = np.asarray(P, float)
+    fwd = P[9] - P[0]
+    lat = P[5] - P[17]
+    if np.linalg.norm(fwd) < 1e-6 or np.linalg.norm(lat) < 1e-6:
+        return np.zeros(5)
+    fwd = fwd / np.linalg.norm(fwd)
+    lat = lat - (lat @ fwd) * fwd
+    lat = lat / max(np.linalg.norm(lat), 1e-9)
+    n = np.cross(fwd, lat)
+    out = [0.0]
+    for m, q in _SPLAY_BONES:
+        b = P[q] - P[m]
+        bp = b - (b @ n) * n
+        inplane = np.linalg.norm(bp) / max(np.linalg.norm(b), 1e-9)
+        ang = math.atan2(bp @ lat, bp @ fwd)
+        fade = min(1.0, max(0.0, (inplane - 0.5) / 0.3))
+        out.append(fade * (ang - _SPLAY_REST[len(out) - 1]) / _SPLAY_UNIT)
+    return np.clip(out, -1.0, 1.0)
+
+
 # ---------------------------------------------------------------- stereo palm
 class PalmTracker:
     """Fuses the two cameras' detections of one capture instant into palm poses."""
@@ -307,6 +339,8 @@ class Bridge:
         self.subs = {}                   # addr -> (last subscribe time, version)
         self.seq = 0
         self.private_only = private_only
+        self.splay = False               # --splay: finger splay from the joints (else 0, as before)
+        self.splay_filt = {side: OneEuro(1.0, 1.0) for side in ("left", "right")}
         self.lock = threading.Lock()
         threading.Thread(target=self._rx, daemon=True).start()
 
@@ -360,7 +394,10 @@ class Bridge:
             else:
                 pos, q, conf = p[0], p[1], p[2]
                 curls = p[4] if len(p) > 4 else np.zeros(5)
-                fields = (1, conf, *map(float, pos), *map(float, q), age, *map(float, curls), *([0.0] * 5))
+                splays = np.zeros(5)
+                if self.splay and len(p) > 3 and p[3] is not None and np.shape(p[3]) == (21, 3):
+                    splays = self.splay_filt[side](finger_splays(p[3]), t_cap_ns / 1e9)
+                fields = (1, conf, *map(float, pos), *map(float, q), age, *map(float, curls), *map(float, splays))
                 pa, ra = (max(0.0, float(v)) for v in ages.get(side, (0.0, 0.0)))
             body += _HAND.pack(*fields)
             body4 += _HAND4.pack(*fields, pa, ra)
