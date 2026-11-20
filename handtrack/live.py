@@ -340,6 +340,9 @@ def main():
                     help="Mercury inference (default CPU). framenpu: FrameNPU in this process (root); "
                          "service: FrameNPU through the NPU service (headset/install_npu_service.sh), the "
                          "tracker runs as the user. FrameNPU failures fall back to CPU")
+    ap.add_argument("--merc-model", help="a retrained Mercury keypoint ONNX (same graph) instead of "
+                    "grayscale_keypoint_jan18.onnx, for CPU inference; for the NPU service install the "
+                    "service with MERC_MODEL=... (headset/install_npu_service.sh)")
     ap.add_argument("--npu-socket", help="NPU service socket (default /run/mrhand-npu/npu.sock)")
     ap.add_argument("--framenpu-jobs", type=os.path.expanduser,
                     help="qualified FrameNPU replay build directory (link.json, image and loader)")
@@ -406,6 +409,8 @@ def main():
     a = ap.parse_args()
     if a.merc_inference == "framenpu" and not a.framenpu_jobs:
         ap.error("--merc-inference framenpu requires --framenpu-jobs")
+    if a.merc_model and a.merc_inference != "cpu":
+        ap.error("--merc-model needs --merc-inference cpu")
     if a.merc_inference == "framenpu" and a.backend != "mercury":
         ap.error("--merc-inference framenpu requires --backend mercury")
     import handtrack.fasttrack as _ft
@@ -464,7 +469,7 @@ def main():
         from handtrack.merctrack import MercuryTracker
         merc_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
                                         initializer=mpworker.init_mercury_proc,
-                                        initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket))
+                                        initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket, a.merc_model))
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched

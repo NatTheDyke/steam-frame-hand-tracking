@@ -155,12 +155,12 @@ class Client:
 
 # ---------------------------------------------------------------- server
 class Server:
-    def __init__(self, model, jobs, path, uid, session_factory=None):
+    def __init__(self, model, jobs, path, uid, session_factory=None, require_pin=True):
         self.model, self.jobs, self.path, self.uid = model, jobs, path, uid
         if session_factory is None:
             def session_factory():
                 from framenpu.mercury_runtime import MercurySession
-                return MercurySession(self.model, self.jobs)
+                return MercurySession(self.model, self.jobs, require_pin=require_pin)
         self.session_factory = session_factory
         self.session = None
         self.stop = False
@@ -301,9 +301,11 @@ def main():
     ap.add_argument("--jobs", required=True)
     ap.add_argument("--user", required=True, help="the only non-root user allowed to connect")
     ap.add_argument("--socket", default=SOCKET)
+    ap.add_argument("--unpinned", action="store_true",
+                    help="accept a retrained keypoint model (same graph) instead of the pinned Mercury hash")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    srv = Server(a.model, a.jobs, a.socket, pwd.getpwnam(a.user).pw_uid)
+    srv = Server(a.model, a.jobs, a.socket, pwd.getpwnam(a.user).pw_uid, require_pin=not a.unpinned)
 
     def stop(*_):
         srv.stop = True

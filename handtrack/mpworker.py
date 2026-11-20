@@ -39,6 +39,7 @@ def init(gpu=False, mirrored=True):
 
 _merc = None
 _merc_config = {}
+_merc_model = "~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"
 
 
 def init_mercury():
@@ -49,12 +50,12 @@ def init_mercury():
         from handtrack.calib import Rig
         from handtrack.mercury_kp import MercuryKeypoint
         src = camsource.active()          # HANDTRACK_SOURCE, inherited from live.py
-        _merc = MercuryKeypoint(os.path.expanduser("~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"),
+        _merc = MercuryKeypoint(os.path.expanduser(_merc_model),
                                 Rig(), src.slot_cams, 640, source=src, **_merc_config)
     return _merc
 
 
-def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None):
+def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, model=None):
     """Initializer for the dedicated Mercury worker process (no MediaPipe in it)."""
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(v, "1")
@@ -63,7 +64,9 @@ def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None):
         os.nice(10)
     except (AttributeError, OSError):
         pass
-    global _merc_config
+    global _merc_config, _merc_model
+    if model:
+        _merc_model = model
     _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs, npu_socket=npu_socket)
     init_mercury()
     from multiprocessing.util import Finalize
