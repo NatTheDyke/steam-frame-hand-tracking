@@ -22,7 +22,9 @@ MODEL=${MERC_MODEL:-$H/handtrack/models/mercury/grayscale_keypoint_jan18.onnx}
 MNAME=$(basename "$MODEL")
 UVENV=$H/handtrack/venv
 MODEL_SHA=40c0daa598cedb993b54fff17685231b7465d6db342656c401b01c2029efd1d5
-IMAGE_SHA=d7a78a81469c10acaf193b0d99cc0415f92d1de845a7a9aa292a7a1ebe691819
+# qualified job images: the replay build, or the same build with the heatmap head on the DSP
+# (--mheads, needs a FrameNPU with HEADS_IMAGE_SHA256)
+IMAGE_SHAS="d7a78a81469c10acaf193b0d99cc0415f92d1de845a7a9aa292a7a1ebe691819 582d79ce821304ab90b48d18c5e9d7c5e4396614b9c6eb70bf2e7b6febf114d3"
 D=/var/lib/mrhand-npu
 
 UNPINNED=
@@ -32,7 +34,8 @@ if [ -n "${MERC_MODEL:-}" ]; then
 else
   echo "$MODEL_SHA  $MODEL" | sha256sum -c --quiet
 fi
-echo "$IMAGE_SHA  $JOBS/teacher_link.bin" | sha256sum -c --quiet
+GOT=$(sha256sum "$JOBS/teacher_link.bin" | cut -d" " -f1)
+[[ " $IMAGE_SHAS " == *" $GOT "* ]] || { echo "unqualified job image $GOT" >&2; exit 1; }
 for f in link.json teacher_link_loader.fjob; do [ -f "$JOBS/$f" ] || { echo "missing $JOBS/$f" >&2; exit 1; }; done
 
 systemctl stop mrhand-npu.service 2>/dev/null || true

@@ -35,7 +35,12 @@ import signal
 import socket
 import struct
 
-import numpy as np
+# One BLAS thread: the host heads are small matmuls, and OpenBLAS worker threads spin between them.
+# Measured on the Frame (2026-11-20): 11.8 -> 4.4 ms of service CPU per crop.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import numpy as np  # noqa: E402
 
 SOCKET = "/run/mrhand-npu/npu.sock"
 INPUTS = (("inputImg", (1, 1, 128, 128)), ("lastKeypoints", (1, 42)), ("useLastKeypoints", (1,)))
