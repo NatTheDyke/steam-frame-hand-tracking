@@ -83,7 +83,7 @@ def main():
         if nohint:
             print("   crops WITHOUT keypoint hint (recovery): %d, outcomes %s" % (
                 len(nohint), dict(collections.Counter(r[12] for r in nohint))))
-        acc = np.array([r[12] in ("mono", "stereo") for r in Rr])
+        acc = np.array([r[12] in ("mono", "stereo", "pair") for r in Rr])
         print("   NEW-RESULT LATENCY cap->collect, accepted only ms %s" % pct(((col - cap) / 1e6)[ok & acc]))
         for side in ("left", "right"):
             rs = [r for r in Rr if r[2] == side and r[12] in ("mono", "stereo")]

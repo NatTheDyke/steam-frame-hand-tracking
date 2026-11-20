@@ -71,6 +71,9 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 #   pos_filter    = <min_cutoff> <beta> | off   sent position One Euro (fast path)
 #   rot_glide_ms  = <ms>  (0 = off)             exponential glide toward the newest orientation
 #   merc_crop     = raw | det | auto            Mercury crop source (default: the --merc-crop option)
+#   merc_views    = both | alternate | auto     Mercury views per hand and frame (default: --merc-views)
+#   stereo_comp   = on | off                    move an older view by the palm motion before triangulating
+#                                               (default: --merc-stereo-comp)
 #   send_offset_ms = <ms> (default 0)           shift the capture time sent to the PC driver, which picks the
 #                                               head pose for placing the hand in the world by that time
 #                                               (diagnostic for hands that move with the head)
@@ -78,7 +81,8 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 # it moves (orientation lag ~130 vs ~160 ms, same still-hand jitter).  The previous smooth profile is
 # tools/profile_smooth_v1.conf (copy it to ~/.config/mrhand/profile to go back).
 PROFILE_DEFAULTS = {"axis_filter": (0.4, 1.2), "centre_filter": (1.5, 0.6), "curl_filter": (1.0, 1.0),
-                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0, "merc_crop": None}
+                    "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0, "merc_crop": None,
+                    "merc_views": None, "stereo_comp": None}
 
 
 class Profile:
@@ -99,6 +103,10 @@ class Profile:
                 v[k] = float(val)
             elif k == "merc_crop":
                 v[k] = val if val in ("raw", "det", "auto") else None
+            elif k == "merc_views":
+                v[k] = val if val in ("both", "alternate", "auto") else None
+            elif k == "stereo_comp":
+                v[k] = {"on": True, "off": False}.get(val)
             elif val == "off":
                 v[k] = None
             else:
@@ -347,6 +355,12 @@ def main():
     ap.add_argument("--merc-stereo-ms", type=float, default=40.0,
                     help="max capture-time gap (ms) for triangulating two Mercury views; 0 = only the same capture "
                          "(views from different times describe different hand poses when the hand moves)")
+    ap.add_argument("--merc-views", choices=("auto", "both", "alternate"), default="auto",
+                    help="Mercury views per hand and frame: both cameras of the same frame (stereo from one "
+                         "instant, at most 3 crops per job) or alternate cameras (stereo against the other "
+                         "camera's previous frame); auto = both when inference runs on the NPU")
+    ap.add_argument("--merc-stereo-comp", choices=("on", "off"), default="on",
+                    help="triangulating against an older view: shift it by the palm motion since its capture")
     ap.add_argument("--merc-crop", choices=("auto", "raw", "det"), default="auto",
                     help="Mercury crop source: the full-resolution camera frame (raw) or the detector image "
                          "(det); auto = raw when the published frame is larger than --size (tracking cameras)")
@@ -456,10 +470,13 @@ def main():
         mt.sched = a.merc_sched
         mt.predict_roi = a.merc_predict_roi
         mt.stereo_ms = a.merc_stereo_ms
+        mt.views = a.merc_views
+        mt.stereo_comp = a.merc_stereo_comp == "on"
         mt.curl_latest = a.curl_latest
         mt.hint_reset = a.merc_hint_reset
-        print("mercury: stereo<=%.0f ms, curls=%s, hint reset=%s, roi predict=%s, sched=%s" % (
-            mt.stereo_ms, "latest" if mt.curl_latest else "blend", mt.hint_reset, mt.predict_roi, mt.sched),
+        print("mercury: stereo<=%.0f ms, views=%s, motion comp=%s, curls=%s, hint reset=%s, roi predict=%s, sched=%s" % (
+            mt.stereo_ms, mt.views, mt.stereo_comp, "latest" if mt.curl_latest else "blend", mt.hint_reset,
+            mt.predict_roi, mt.sched),
             file=sys.stderr, flush=True)
     bridge = None if a.no_bridge else Bridge()
 
@@ -715,6 +732,9 @@ def main():
                 rot_tau = (a.rot_smooth_ms if pv["rot_glide_ms"] is None else pv["rot_glide_ms"]) / 1000.0
                 send_off_ns = int(pv["send_offset_ms"] * 1e6)
                 merc_raw = crop_is_raw(pv["merc_crop"] or a.merc_crop)
+                if mt is not None:
+                    mt.views = pv["merc_views"] or a.merc_views
+                    mt.stereo_comp = (a.merc_stereo_comp == "on") if pv["stereo_comp"] is None else pv["stereo_comp"]
                 if tel is not None:   # profile switch marker: the report can split results by profile
                     tel.write("P,%d,%s" % (time.monotonic_ns(), ";".join(
                         "%s=%s" % (k, "off" if v is None else (v if not isinstance(v, tuple) else "%g/%g" % v))

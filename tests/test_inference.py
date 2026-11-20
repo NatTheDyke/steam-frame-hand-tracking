@@ -204,6 +204,94 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(tracker.job_info, {})
 
 
+class MercuryViewTests(unittest.TestCase):
+    """Both views of one frame -> stereo from one instant; an older view is moved with the palm."""
+    O = (np.array([0.0527, -0.0186, -0.0368]), np.array([-0.0528, -0.0186, -0.037]))   # SLAM cameras
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from handtrack.merctrack import MercuryTracker, HandState
+        self.HandState = HandState
+        self.poses = []
+        self.R = np.diag([1.0, -1.0, -1.0])                  # camera -> head: cameras look forward (-z)
+        palm = SimpleNamespace(pose={s: (self.R, self.O[s]) for s in (0, 1)},
+                               raw_quat=lambda side, P: (1.0, 0.0, 0.0, 0.0),
+                               curl_filt={sd: (lambda c, t: c) for sd in ("left", "right")},
+                               _pose=lambda side, P, t, conf: self.poses.append((side, P.copy(), t)) or
+                               (P[0], (1.0, 0.0, 0.0, 0.0), conf, P))
+        self.pool = Mock()
+        self.mt = MercuryTracker(palm, self.pool, Mock())
+        rng = np.random.default_rng(4)
+        self.J = rng.normal(0, 0.03, (21, 3)) + [0.0, -0.2, -0.5]          # a hand 0.5 m ahead, below
+
+    def result(self, slot, P, ok=True):
+        d = P - self.O[slot]
+        return {"is_hand": 0.99 if ok else 0.5, "rays": (d / np.linalg.norm(d, axis=1)[:, None]) @ self.R,
+                "rel_depth": np.zeros(21), "curls": np.zeros(5), "curl_var": np.ones(5), "det_px": None}
+
+    def run_job(self, results, t_ns, fast_pos):
+        from concurrent.futures import Future
+        f = Future()
+        f.set_result([(slot, side, r, 0.01, {"inference": "framenpu"}) for slot, side, r in results])
+        self.mt.job = (f, t_ns, fast_pos, {0: None, 1: None}, 0, len(results))
+        return self.mt.collect()
+
+    def test_both_views_of_one_frame_triangulate_once(self):
+        self.mt.views = "both"
+        self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+        self.assertTrue(self.mt.submit({0: 0, 1: 0}, 10**9, {}))
+        jobs = self.pool.submit.call_args.args[1]
+        self.assertEqual(sorted(j[0] for j in jobs), [0, 1])
+        out = self.run_job([(0, "right", self.result(0, self.J)), (1, "right", self.result(1, self.J))], 10**9, {})
+        self.assertEqual(len(self.poses), 1)                    # one pose per hand and frame
+        self.assertEqual([r["outcome"] for r in self.mt.records], ["pair", "stereo"])
+        np.testing.assert_allclose(self.poses[0][1], self.J, atol=1e-9)
+        self.assertIn("right", out)
+
+    def test_pair_with_a_rejected_second_view_still_poses(self):
+        self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+        self.run_job([(0, "right", self.result(0, self.J)), (1, "right", self.result(1, self.J, ok=False))],
+                     10**9, {})
+        self.assertEqual(len(self.poses), 1)
+        self.assertEqual(self.mt.records[0]["outcome"], "mono")
+
+    def test_second_views_take_turns_between_two_hands(self):
+        self.mt.views = "both"
+        self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+        self.mt.hands["left"] = self.HandState("left", self.J + [-0.3, 0, 0], 0.9)
+        doubled = []
+        for k in range(4):
+            self.mt.job = None
+            self.assertTrue(self.mt.submit({0: 0, 1: 0}, 10**9 + k, {}))
+            jobs = self.pool.submit.call_args.args[1]
+            self.assertEqual(len(jobs), 3)                      # at most three crops per job
+            doubled.append([sd for sd in ("left", "right") if sum(j[1] == sd for j in jobs) == 2][0])
+        self.assertEqual(len(set(doubled[0::2])), 1)
+        self.assertNotEqual(doubled[0], doubled[1])
+
+    def test_cpu_inference_alternates_in_auto(self):
+        self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+        self.mt.last_inference = "cpu"
+        self.assertTrue(self.mt.submit({0: 0, 1: 0}, 10**9, {}))
+        self.assertEqual(len(self.pool.submit.call_args.args[1]), 1)
+
+    def test_older_view_is_moved_with_the_palm(self):
+        self.mt.views = "alternate"
+        move = np.array([0.01, 0.0, 0.0])                       # 1 cm between the two captures
+        errs = {}
+        for comp in (False, True):
+            self.poses.clear()
+            self.mt.stereo_comp = comp
+            self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+            c0 = self.J[[0, 5, 9, 17]].mean(0)
+            self.run_job([(0, "right", self.result(0, self.J))], 10**9, {"right": (c0,)})
+            self.run_job([(1, "right", self.result(1, self.J + move))], 10**9 + 33 * 10**6, {"right": (c0 + move,)})
+            P = self.poses[-1][1]
+            errs[comp] = np.linalg.norm(P[[0, 5, 9, 17]].mean(0) - (c0 + move))
+        self.assertLess(errs[True], 1e-6)
+        self.assertGreater(errs[False], 0.005)
+
+
 class AdmissionTests(unittest.TestCase):
     PERIOD = 1 / 60
 

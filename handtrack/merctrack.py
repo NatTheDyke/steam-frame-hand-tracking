@@ -8,6 +8,15 @@ knuckle in hand-size units; absolute depth is anchored to the 60 Hz stereo palm 
 optical-flow tracker when available, else to the previous state.  When the other camera's result
 for the same hand is fresh (< STEREO_MS), joints are triangulated instead.
 
+Views per hand (views): "both" crops the hand from both cameras of the same frame (at most
+MAX_CROPS crops per job; with two hands the second view takes turns), so stereo joints come from
+one instant.  "alternate" (the original) crops one camera per frame and triangulates against the
+other camera's previous result, captured a frame earlier: a moving hand has moved between the two
+views, which puts a triangulated palm 2-7 cm off at 0.3-0.6 m/s (more at distance) and tilts the
+palm when the wrist turns.  "auto" = both when inference is on the NPU, alternate on the CPU.
+With stereo_comp the older view's rays are shifted by the palm's motion since its capture
+(from the 60 Hz two-camera palm positions), which removes the translation part of that error.
+
 The Mercury model license is UNVERIFIED (local evaluation only).
 """
 import time
@@ -21,6 +30,7 @@ STEREO_MS = 40.0          # other view's rays this fresh -> triangulate joints
 COLLAPSE_M = 0.07         # two tracked hands closer than this (palm centres) = one physical hand
 CURL_SCALE = (2.0, 4.0, 4.0, 4.0, 4.0)   # Mercury curl output (negative = flexed) -> 0..1, thumb first
                                          # (provisional mapping, not calibrated against ground truth)
+MAX_CROPS = 3             # crops per Mercury job (one NPU request)
 LOST_AFTER_S = 0.35       # no accepted Mercury observation for this long -> back to discovery
 
 
@@ -33,7 +43,8 @@ class HandState:
         self.next_slot = 1
         self.last_submit = 0.0                    # monotonic s of the last job that included this hand
         self.vel = np.zeros(3)                    # palm velocity (m/s) from the last two accepted observations
-        self.last_rays = {}                       # slot -> (t, origin, rays head frame)
+        self.last_rays = {}                       # slot -> (t, origin, rays head frame, palm position at t or None)
+        self.last_both = 0.0                      # monotonic s of the last job with both views of this hand
         self.misses = 0
         self.created = t
         self.curls_by_view = {}                   # slot -> (t, mercury curls (5,), variances (5,))
@@ -56,6 +67,9 @@ class MercuryTracker:
         self.sched = "batch"                      # "batch": all hands in one job (original);
                                                   # "perhand": one hand per job on the newest frame,
                                                   # least recently serviced hand first
+        self.views = "auto"                       # "both" | "alternate" | "auto" (module docstring)
+        self.stereo_comp = True                   # shift an older view's rays by the palm motion since its capture
+        self.last_inference = "cpu"               # backend of the last result (views = auto)
         self.collapsed = None
         self.next_id = 0
         self.records = []                         # per-observation timing records, drained by the caller
@@ -103,6 +117,10 @@ class MercuryTracker:
         if self.sched == "perhand":
             sides = [min(sides, key=lambda sd: self.hands[sd].last_submit)]
         t_sub = time.monotonic()
+        both = self.views == "both" or (self.views == "auto" and self.last_inference != "cpu")
+        # second views take turns between hands: the hand that had both views longest ago goes first
+        spare = MAX_CROPS - len(sides) if both else 0
+        second = set(sorted(sides, key=lambda sd: self.hands[sd].last_both)[:max(0, spare)])
         for side in sides:
             hs = self.hands[side]
             hs.last_submit = t_sub
@@ -133,6 +151,12 @@ class MercuryTracker:
             # a crop after a rejected observation or without a fresh flow position is a recovery crop:
             # the previous keypoints describe a hand that is no longer there, so do not feed them as a hint
             hint = not (self.hint_reset and (hs.misses > 0 or fp is None))
+            if side in second:                    # the other camera of the same frame too
+                R2, t2 = self.palm.pose[1 - slot]
+                jc2 = (P - t2) @ R2
+                if not (jc2[:, 2] < 0.08).any():
+                    jobs.append((1 - slot, side, jc2, expand, hint))
+                    hs.last_both = t_sub
             jobs.append((slot, side, jc, expand, hint))
         if not jobs:
             return False
@@ -164,7 +188,12 @@ class MercuryTracker:
         except Exception:
             return {}
         out = {}
-        for slot, side, r, dsec, *tim in res:
+        def valid(r):
+            return r is not None and r["is_hand"] >= 0.97
+        # a valid result followed by another valid one for the same hand in this job (both views of
+        # one frame): keep its rays for the later one to triangulate with, and pose the hand once
+        later = [any(rs[1] == side and valid(rs[2]) for rs in res[i + 1:]) for i, (_, side, *_) in enumerate(res)]
+        for (slot, side, r, dsec, *tim), paired in zip(res, later):
             self.stats["runs"] += 1
             self.stats["ms"].append(dsec * 1e3)
             tim = tim[0] if tim else {}
@@ -181,18 +210,31 @@ class MercuryTracker:
             if hs is None:
                 rec["outcome"] = "gone"
                 continue
-            if r is None or r["is_hand"] < 0.97:
+            self.last_inference = rec["inference"]
+            if not valid(r):
                 self.stats["rejected"] += 1
                 hs.misses += 1
                 continue
             R, o = self.palm.pose[slot]
             rays = r["rays"] @ R.T                       # head frame
-            hs.last_rays[slot] = (t, o, rays)
+            fp_now = fast_pos.get(side)
+            fp_now = np.asarray(fp_now[0], float) if fp_now is not None else None
+            hs.last_rays[slot] = (t, o, rays, fp_now)
+            if paired:
+                hs.curls_by_view[slot] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
+                rec["outcome"] = "pair"
+                continue
             other = hs.last_rays.get(1 - slot)
             P = None
             if other is not None and abs(t - other[0]) * 1e3 <= self.stereo_ms and \
                     (self.stereo_ms > 0 or t == other[0]):
-                (to, oo, ro) = other
+                (to, oo, ro, fpo) = other
+                if self.stereo_comp and t != to:
+                    # the hand moved since the other view was captured: move that view with it
+                    move = fp_now - fpo if fp_now is not None and fpo is not None else hs.vel * (t - to)
+                    if np.linalg.norm(move) < 0.1:
+                        oo = oo + move
+                    rec["comp_mm"] = float(np.linalg.norm(move)) * 1e3
                 Pm, gap, s1, s2 = triangulate(np.broadcast_to(o, rays.shape), rays, np.broadcast_to(oo, ro.shape), ro)
                 if np.median(gap) < 0.02 and (s1 > 0.05).all() and (s2 > 0.05).all():
                     P = Pm
