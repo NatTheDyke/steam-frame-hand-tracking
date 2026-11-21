@@ -136,5 +136,26 @@ class CropPreparation(unittest.TestCase):
         self.assertGreaterEqual(same, 396)          # float64 rounding may move a sample across 1/32 px
 
 
+    def test_refine_all_matches_refine(self):
+        rng = np.random.default_rng(5)
+        G = M.GRID
+        yy, xx = np.mgrid[0:G, 0:G]
+        worst = 0.0
+        for case in range(300):
+            peaks = rng.uniform(-1, G, (21, 2))
+            hm = np.exp(-((xx - peaks[:, :1, None]) ** 2 + (yy - peaks[:, 1:, None]) ** 2) / rng.uniform(.5, 8))
+            hm = (hm + rng.uniform(0, .05, hm.shape) * (case % 3 != 0)).astype(np.float32)
+            if case % 10 == 0:
+                hm[3] = 0                                      # zero map: first cell, unrefined
+            if case % 10 == 1:
+                hm[4, 5, 21] = hm[4].max() + 1                 # peak on the last column: a one-column window
+            flat = hm.reshape(21, G * G)
+            want = np.array([M.MercuryKeypoint._refine(hm[i], *divmod(int(flat[i].argmax()), G)[::-1])
+                             for i in range(21)])
+            got = M.MercuryKeypoint._refine_all(flat)
+            worst = max(worst, float(np.abs(got - want).max()))
+        self.assertLess(worst, 1e-5)                           # grid cells; float32 vs float64 sums
+
+
 if __name__ == "__main__":
     unittest.main()

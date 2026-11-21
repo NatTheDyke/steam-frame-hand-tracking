@@ -259,11 +259,8 @@ class MercuryKeypoint:
         hm, hd, extras, curls = (outputs[n] for n in (
             "heatmap_xy", "heatmap_depth", "scalar_extras", "curls"))
         hm = hm[0].reshape(21, GRID * GRID)
-        locs = np.zeros((21, 2))
         conf = hm.max(1)
-        for i in range(21):
-            row, col = divmod(int(hm[i].argmax()), GRID)
-            locs[i] = self._refine(hm[i].reshape(GRID, GRID), col, row)
+        locs = self._refine_all(hm)
         px = (1 - locs[:, 0] / 11.0) if flip else (locs[:, 0] / 11.0 - 1)
         py = 1 - locs[:, 1] / 11.0
         dl = sg_unproject(px * r, py * r)
@@ -278,6 +275,27 @@ class MercuryKeypoint:
         return {"rays": rays, "det_px": self.raw_to_det(raw, slot), "conf": conf, "rel_depth": rel,
                 "is_hand": float(1 / (1 + math.exp(-float(extras[0][0])))),
                 "curls": curls[0][:5].copy(), "curl_var": np.abs(curls[0][5:]) + 0.01, "crop": img}
+
+    @staticmethod
+    def _refine_all(hm, kmax=10):
+        """_refine for every joint at once: hm (J, GRID*GRID) -> (J, 2) refined (x, y).
+
+        Same peak (first argmax), the same clamped window and the same zero-sum fallback; the
+        window is a row mask times a column mask, and the sums are taken in float64."""
+        cy, cx = np.divmod(hm.argmax(1), GRID)
+        g = np.arange(GRID)
+        kx = np.maximum(0, np.minimum(cx, np.minimum(kmax, np.abs(cx - GRID) - 1)))
+        ky = np.maximum(0, np.minimum(cy, np.minimum(kmax, np.abs(cy - GRID) - 1)))
+        mx = np.abs(g - cx[:, None]) <= kx[:, None]             # (J, GRID) columns in the window
+        my = np.abs(g - cy[:, None]) <= ky[:, None]             # (J, GRID) rows in the window
+        h = hm.reshape(-1, GRID, GRID).astype(np.float64)
+        rows = np.einsum("jyx,jx->jy", h, mx)                   # each row's sum over window columns
+        s = np.einsum("jy,jy->j", rows, my)
+        sx = np.einsum("jyx,jy,jx->j", h, my, mx * (g + 0.5))
+        sy = np.einsum("jy,jy->j", rows, my * (g + 0.5))
+        ok = s != 0
+        safe = np.where(ok, s, 1)
+        return np.stack([np.where(ok, sx / safe, cx), np.where(ok, sy / safe, cy)], 1).astype(float)
 
     @staticmethod
     def _refine(h, cx, cy, kmax=10):
