@@ -45,6 +45,14 @@ def q_conj(q):
     return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+def q_matrix(q):
+    """Rotation matrix of unit quaternion q: q_matrix(q) @ v == q_rot(q, v)."""
+    w, x, y, z = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
 def q_from_two_vectors(a, b):
     """Minimal rotation taking direction a to direction b (Eigen setFromTwoVectors)."""
     a = a / np.linalg.norm(a)
@@ -68,6 +76,20 @@ def direction(dir3, twist):
     return q_mul(one, two)
 
 
+def _direction(v, twist):
+    """direction(v, twist) in scalar arithmetic: q_from_two_vectors((0, 0, -1), v), then the twist."""
+    n = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    bx, by, bz = v[0] / n, v[1] / n, v[2] / n
+    c = -bz
+    if c < -1 + 1e-6:                      # opposite of -z: the general path
+        return direction(np.asarray(v, float), twist)
+    s = math.sqrt((1 + c) * 2)
+    w1, x1, y1 = s / 2, by / s, -bx / s    # axis cross((0, 0, -1), b) = (by, -bx, 0)
+    h = twist / 2
+    w2, z2 = math.cos(h), -math.sin(h)
+    return np.array([w1 * w2, x1 * w2 + y1 * z2, -x1 * z2 + y1 * w2, w1 * z2])
+
+
 def sg_unproject(x, y):
     d = 1 + x * x + y * y
     return np.stack([2 * x / d, 2 * y / d, (-1 + x * x + y * y) / d], -1)
@@ -83,21 +105,32 @@ def project_unscaled(joints_m, q):
 
 def make_instructions(joints_m, flip, expand=EXPAND, twist=0.0):
     """joints_m: (21,3) in Mercury camera frame.  Returns rot_quat, radius, predicted keypoints
-    (21,2) in the model's normalised input convention, relative depths (21,)."""
+    (21,2) in the model's normalised input convention, relative depths (21,).
+
+    Same iterations and formulas as Mercury; the joint directions are normalised once and each
+    projection is one matrix product (project_unscaled and direction give the same values)."""
+    dn = joints_m / np.linalg.norm(joints_m, axis=1, keepdims=True)
+
+    def project(q):
+        d = dn @ q_matrix(q)               # rows R^T d: rotation by conj(q)
+        den = 1 - d[:, 2]
+        return np.stack([d[:, 0] / den, d[:, 1] / den], 1)
+
     dir3 = joints_m[9] / np.linalg.norm(joints_m[9])
-    q = direction(dir3, twist)
+    q = _direction(dir3, twist)
     old = dir3
     for _ in range(8):
-        sg = project_unscaled(joints_m, q)
+        sg = project(q)
         mn, mx = sg.min(0), sg.max(0)
-        c = (mn + mx) / 2
-        r = max(c[0] - mn[0], c[1] - mn[1])
-        new = q_rot(q, sg_unproject(c[0], c[1]))[0]
-        q = direction(new, twist)
+        c0, c1 = (mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2
+        r = max(c0 - mn[0], c1 - mn[1])
+        dd = 1 + c0 * c0 + c1 * c1         # sg_unproject(c0, c1)
+        new = q_matrix(q) @ np.array([2 * c0 / dd, 2 * c1 / dd, (-1 + c0 * c0 + c1 * c1) / dd])
+        q = _direction(new, twist)
         if np.linalg.norm(old - new) < 1e-4:
             break
         old = new
-    sg = project_unscaled(joints_m, q)
+    sg = project(q)
     fwd = np.linalg.norm(sg[0] - sg[9])
     side = np.linalg.norm(sg[5] - sg[17])
     palm_l = max(fwd, side)
@@ -125,6 +158,7 @@ class MercuryKeypoint:
         self.det_size, self.raw_size = det_size, raw_size
         g = (np.arange(WSIZE, dtype=np.float32))
         self.gx, self.gy = np.meshgrid(g, g)
+        self.axis = 1 - 2 * np.arange(WSIZE) / WSIZE   # sx = -r * axis[col] (unflipped), sy = r * axis[row]
 
     # det image (rotated, det_size square) <-> raw calibrated pixels
     def raw_to_det(self, raw, slot):
@@ -142,13 +176,7 @@ class MercuryKeypoint:
         """128x128 crop.  det_img is the det_size detector image, or with raw=True the camera frame
         as published in the shm (unrotated, raw aspect, any scale): sampling the full-resolution
         frame keeps detail for small (distant) hands that the detector image has already lost."""
-        sx = (-r + 2 * r * self.gx / WSIZE) if not flip else (r - 2 * r * self.gx / WSIZE)
-        sy = r - 2 * r * self.gy / WSIZE
-        d = np.stack([2 * sx, 2 * sy, sx * sx + sy * sy - 1], -1).reshape(-1, 3)
-        d = q_rot(q, d)
-        d[:, 1] *= -1           # Mercury -> OpenCV camera frame
-        d[:, 2] *= -1
-        px = self.cam[slot].project(d).reshape(WSIZE, WSIZE, 2)
+        px = self.crop_pixels(slot, q, r, flip)
         if raw:
             raw_w = self.src.raw_w if self.src is not None else self.raw_size
             f = det_img.shape[1] / raw_w                       # published pixels per raw pixel
@@ -156,6 +184,25 @@ class MercuryKeypoint:
         else:
             m = self.raw_to_det(px, slot).astype(np.float32)
         return cv2.remap(det_img, m[..., 0], m[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+    def crop_pixels(self, slot, q, r, flip):
+        """Calibrated raw pixel (W, W, 2) sampled by each crop pixel.
+
+        The stereographic ray of pixel (row, col) is (2 sx, 2 sy, sx^2 + sy^2 - 1) with sx from the
+        column and sy from the row, so each rotated component is a row term plus a column term.
+        Then Mercury -> OpenCV (y, z negated) and the camera's Kannala-Brandt projection."""
+        cam = self.cam[slot]
+        a = self.axis * (r if flip else -r)
+        b = self.axis * r
+        a2, b2 = a * a, b * b
+        R = q_matrix(q)
+        x = (2 * R[0, 1] * b + R[0, 2] * (b2 - 1))[:, None] + (2 * R[0, 0] * a + R[0, 2] * a2)[None, :]
+        y = (-(2 * R[1, 1] * b + R[1, 2] * (b2 - 1)))[:, None] + (-(2 * R[1, 0] * a + R[1, 2] * a2))[None, :]
+        z = (-(2 * R[2, 1] * b + R[2, 2] * (b2 - 1)))[:, None] + (-(2 * R[2, 0] * a + R[2, 2] * a2))[None, :]
+        rr = np.hypot(x, y)
+        d = cam._d(np.arctan2(rr, z))
+        s = np.where(rr > 1e-12, d / np.maximum(rr, 1e-12), 0)
+        return np.stack([cam.fx * x * s + cam.cx, cam.fy * y * s + cam.cy], -1)
 
     @staticmethod
     def normalise(img):
