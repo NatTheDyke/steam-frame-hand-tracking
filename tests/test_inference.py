@@ -292,6 +292,28 @@ class MercuryViewTests(unittest.TestCase):
         self.assertGreater(errs[False], 0.005)
 
 
+    def test_single_view_curls_replace_only_the_chosen_fingers(self):
+        from handtrack.merctrack import view_joints
+        from handtrack.palm import finger_curls
+        J = self.J
+        o = self.O[0]
+        d = J - o
+        rays = d / np.linalg.norm(d, axis=1)[:, None]
+        hs = np.linalg.norm(J[0] - J[9])
+        rel = (np.linalg.norm(d, axis=1) - np.linalg.norm(d[9])) / hs
+        np.testing.assert_allclose(view_joints(J, hs, o, rays, rel), J, atol=1e-12)   # exact rays + depths -> same hand
+        self.mt.views = "alternate"
+        self.mt.curl_geo = [1]
+        self.mt.hands["right"] = self.HandState("right", J, 0.9)
+        res = self.result(0, J)
+        res["curls"] = np.full(5, -2.0)                       # Mercury curl output: 1.0 thumb, 0.5 fingers
+        res["rel_depth"] = rel
+        out = self.run_job([(0, "right", res)], 10**9, {})
+        curls = out["right"][0][4]
+        self.assertAlmostEqual(curls[1], finger_curls(J)[1], places=9)   # index from the view's joints
+        np.testing.assert_allclose(curls[[0, 2, 3, 4]], [1.0, 0.5, 0.5, 0.5])
+
+
 class AdmissionTests(unittest.TestCase):
     PERIOD = 1 / 60
 

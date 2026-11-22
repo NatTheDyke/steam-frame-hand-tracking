@@ -80,6 +80,7 @@ PROFILE_FILE = os.path.expanduser("~/.config/mrhand/profile")
 # Default = "A" from the 2026-10-11 latency pass: smoother than before when the hand is still, faster when
 # it moves (orientation lag ~130 vs ~160 ms, same still-hand jitter).  The previous smooth profile is
 # tools/profile_smooth_v1.conf (copy it to ~/.config/mrhand/profile to go back).
+FINGERS = ("thumb", "index", "middle", "ring", "pinky")    # curl / splay order
 PROFILE_DEFAULTS = {"axis_filter": (0.4, 1.2), "centre_filter": (1.5, 0.6), "curl_filter": (1.0, 1.0),
                     "pos_filter": (1.2, 1.5), "rot_glide_ms": 25.0, "send_offset_ms": 0.0, "merc_crop": None,
                     "merc_views": None, "stereo_comp": None}
@@ -367,6 +368,9 @@ def main():
     ap.add_argument("--merc-crop", choices=("auto", "raw", "det"), default="auto",
                     help="Mercury crop source: the full-resolution camera frame (raw) or the detector image "
                          "(det); auto = raw when the published frame is larger than --size (tracking cameras)")
+    ap.add_argument("--curl-geo-fingers", default="",
+                    help="comma list of fingers (thumb,index,middle,ring,pinky) whose curl comes from each camera "
+                         "view's own single-view joints instead of --curl-source; e.g. index")
     ap.add_argument("--splay", action="store_true",
                     help="send finger splay (sideways spread) computed from the 3D joints (default: 0); older PC drivers ignore it")
     ap.add_argument("--curl-latest", action="store_true",
@@ -411,6 +415,9 @@ def main():
     a = ap.parse_args()
     if a.merc_inference == "framenpu" and not a.framenpu_jobs:
         ap.error("--merc-inference framenpu requires --framenpu-jobs")
+    bad = [f for f in a.curl_geo_fingers.split(",") if f and f not in FINGERS]
+    if bad:
+        ap.error("--curl-geo-fingers: unknown finger(s) %s (use %s)" % (",".join(bad), ",".join(FINGERS)))
     if a.merc_model and a.merc_inference != "cpu":
         ap.error("--merc-model needs --merc-inference cpu")
     if a.merc_inference == "framenpu" and a.backend != "mercury":
@@ -480,9 +487,11 @@ def main():
         mt.views = a.merc_views
         mt.stereo_comp = a.merc_stereo_comp == "on"
         mt.curl_latest = a.curl_latest
+        mt.curl_geo = [FINGERS.index(f) for f in a.curl_geo_fingers.split(",") if f]
         mt.hint_reset = a.merc_hint_reset
-        print("mercury: stereo<=%.0f ms, views=%s, motion comp=%s, curls=%s, hint reset=%s, roi predict=%s, sched=%s" % (
-            mt.stereo_ms, mt.views, mt.stereo_comp, "latest" if mt.curl_latest else "blend", mt.hint_reset,
+        print("mercury: stereo<=%.0f ms, views=%s, motion comp=%s, curls=%s%s, hint reset=%s, roi predict=%s, sched=%s" % (
+            mt.stereo_ms, mt.views, mt.stereo_comp, "latest" if mt.curl_latest else "blend",
+            (" (single-view joints: %s)" % a.curl_geo_fingers) if mt.curl_geo else "", mt.hint_reset,
             mt.predict_roi, mt.sched),
             file=sys.stderr, flush=True)
     bridge = None if a.no_bridge else Bridge()

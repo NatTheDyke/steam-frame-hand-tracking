@@ -34,6 +34,13 @@ MAX_CROPS = 3             # crops per Mercury job (one NPU request)
 LOST_AFTER_S = 0.35       # no accepted Mercury observation for this long -> back to discovery
 
 
+def view_joints(P, hand_size, origin, rays, rel_depth):
+    """One camera view's joints: its rays at Mercury's relative depths, with the middle knuckle at the
+    distance it has in the accepted hand P (head frame)."""
+    d9 = float(np.linalg.norm(P[9] - origin))
+    return origin + rays * (d9 + rel_depth * hand_size)[:, None]
+
+
 class HandState:
     def __init__(self, side, P, t):
         self.side = side
@@ -48,6 +55,7 @@ class HandState:
         self.misses = 0
         self.created = t
         self.curls_by_view = {}                   # slot -> (t, mercury curls (5,), variances (5,))
+        self.geo_views = {}                       # slot -> (t, origin, rays head frame, Mercury relative depths)
 
 
 class MercuryTracker:
@@ -63,6 +71,8 @@ class MercuryTracker:
         self.predict_roi = False
         self.stereo_ms = STEREO_MS                # max capture-time gap for triangulating two views (0 = same capture only)
         self.curl_latest = False                  # True: curls from this observation only (no blend with older views)
+        self.curl_geo = []                        # finger indices (0 thumb .. 4 pinky) whose curl comes from each
+                                                  # view's own single-view joints instead (view_joints)
         self.hint_reset = False                   # True: no keypoint hint for a crop placed after a miss / lost flow
         self.sched = "batch"                      # "batch": all hands in one job (original);
                                                   # "perhand": one hand per job on the newest frame,
@@ -220,6 +230,7 @@ class MercuryTracker:
             fp_now = fast_pos.get(side)
             fp_now = np.asarray(fp_now[0], float) if fp_now is not None else None
             hs.last_rays[slot] = (t, o, rays, fp_now)
+            hs.geo_views[slot] = (t, o, rays, np.asarray(r["rel_depth"], float))
             if paired:
                 hs.curls_by_view[slot] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
                 rec["outcome"] = "pair"
@@ -281,6 +292,14 @@ class MercuryTracker:
                 raw_curls = np.clip(-mc / np.array(CURL_SCALE), 0, 1)
             else:
                 raw_curls = finger_curls(P)
+            if self.curl_geo:
+                # single-view joints of each fresh view: unlike triangulated joints, whose depth noise
+                # inflates bone angles (open hands read curled), these keep Mercury's own finger depths
+                gv = [hs.geo_views[slot]] if self.curl_latest else \
+                    [v for v in hs.geo_views.values() if t - v[0] < 0.2]
+                g = np.mean([finger_curls(view_joints(P, hs.hand_size, *v[1:])) for v in gv], 0)
+                raw_curls = np.array(raw_curls, float)
+                raw_curls[self.curl_geo] = g[self.curl_geo]
             curls = self.palm.curl_filt[side](raw_curls, t)
             pose = self.palm._pose(side, P, t, conf=r["is_hand"]) + (curls,)
             out[side] = (pose, slot, r["det_px"], t, job_imgs[slot])
