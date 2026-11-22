@@ -145,13 +145,18 @@ def make_instructions(joints_m, flip, expand=EXPAND, twist=0.0):
 # ---------------------------------------------------------------- model wrapper
 class MercuryKeypoint:
     def __init__(self, model_path, rig, slot_cams, det_size, raw_size=2464, threads=1,
-                 backend=None, inference="cpu", framenpu_jobs=None, source=None, npu_socket=None):
+                 backend=None, inference="cpu", framenpu_jobs=None, source=None, npu_socket=None, cell_offset=0.5):
         from handtrack.inference import make_backend
         self.backend = backend if backend is not None else make_backend(
             model_path, threads, inference, framenpu_jobs, npu_socket)
         # source (handtrack/source.py) overrides slot_cams / raw_size and supplies the raw <-> det
         # mapping; without it the original passthrough geometry is used.
         self.src = source
+        # heatmap cell convention: Monado's Mercury puts cell j's centre at j + 0.5 (refine below); the
+        # distilled students (distill/train*.py) were trained with targets peaked at index = label, i.e.
+        # centre j + 0.  Decoding a student with 0.5 shifts every keypoint half a cell (~0.9 deg) along the
+        # crop's x and y (measured on HOT3D: ft7 2D error 0.79 -> 1.06 cells).  Students: cell_offset=0.
+        self.cell_offset = float(cell_offset)
         if source is not None:
             slot_cams = source.slot_cams
         self.cam = {s: rig.cams[n] for s, n in slot_cams.items()}
@@ -260,7 +265,7 @@ class MercuryKeypoint:
             "heatmap_xy", "heatmap_depth", "scalar_extras", "curls"))
         hm = hm[0].reshape(21, GRID * GRID)
         conf = hm.max(1)
-        locs = self._refine_all(hm)
+        locs = self._refine_all(hm) - (0.5 - self.cell_offset)
         px = (1 - locs[:, 0] / 11.0) if flip else (locs[:, 0] / 11.0 - 1)
         py = 1 - locs[:, 1] / 11.0
         dl = sg_unproject(px * r, py * r)

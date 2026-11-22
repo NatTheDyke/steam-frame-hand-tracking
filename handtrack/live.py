@@ -105,7 +105,7 @@ class Profile:
             elif k == "merc_crop":
                 v[k] = val if val in ("raw", "det", "auto") else None
             elif k == "merc_views":
-                v[k] = val if val in ("both", "alternate", "auto") else None
+                v[k] = val if val in ("both", "alternate", "auto", "stereo3d") else None
             elif k == "stereo_comp":
                 v[k] = {"on": True, "off": False}.get(val)
             elif val == "off":
@@ -344,6 +344,9 @@ def main():
     ap.add_argument("--merc-model", help="a retrained Mercury keypoint ONNX (same graph) instead of "
                     "grayscale_keypoint_jan18.onnx, for CPU inference; for the NPU service install the "
                     "service with MERC_MODEL=... (headset/install_npu_service.sh)")
+    ap.add_argument("--merc-cell-offset", type=float, default=0.5,
+                    help="heatmap cell-centre convention of the keypoint model: 0.5 = Monado's Mercury (default); "
+                         "0 = the distilled students (ft3/ft7/...), wherever they run (CPU or NPU service)")
     ap.add_argument("--npu-socket", help="NPU service socket (default /run/mrhand-npu/npu.sock)")
     ap.add_argument("--framenpu-jobs", type=os.path.expanduser,
                     help="qualified FrameNPU replay build directory (link.json, image and loader)")
@@ -359,10 +362,14 @@ def main():
     ap.add_argument("--merc-stereo-ms", type=float, default=40.0,
                     help="max capture-time gap (ms) for triangulating two Mercury views; 0 = only the same capture "
                          "(views from different times describe different hand poses when the hand moves)")
-    ap.add_argument("--merc-views", choices=("auto", "both", "alternate"), default="auto",
+    ap.add_argument("--merc-views", choices=("auto", "both", "alternate", "stereo3d"), default="auto",
                     help="Mercury views per hand and frame: both cameras of the same frame (stereo from one "
                          "instant, at most 3 crops per job) or alternate cameras (stereo against the other "
                          "camera's previous frame); auto = both when inference runs on the NPU")
+    ap.add_argument("--merc-s3d-model", type=os.path.expanduser,
+                    help="3D stereo student ONNX (distill make_stereo3d graph) for --merc-views stereo3d: both cameras' crops of each hand from the same pair, one 3D inference (CPU) plus the keypoint model on both crops")
+    ap.add_argument("--merc-s3d-curls", choices=("geometric", "mercury"), default="geometric",
+                    help="stereo3d curls: from the joints (the 3D hand shape) or the keypoint model's curl head")
     ap.add_argument("--merc-stereo-comp", choices=("on", "off"), default="on",
                     help="triangulating against an older view: shift it by the palm motion since its capture")
     ap.add_argument("--merc-crop", choices=("auto", "raw", "det"), default="auto",
@@ -418,6 +425,8 @@ def main():
     bad = [f for f in a.curl_geo_fingers.split(",") if f and f not in FINGERS]
     if bad:
         ap.error("--curl-geo-fingers: unknown finger(s) %s (use %s)" % (",".join(bad), ",".join(FINGERS)))
+    if a.merc_views == "stereo3d" and not a.merc_s3d_model:
+        ap.error("--merc-views stereo3d needs --merc-s3d-model")
     if a.merc_model and a.merc_inference != "cpu":
         ap.error("--merc-model needs --merc-inference cpu")
     if a.merc_inference == "framenpu" and a.backend != "mercury":
@@ -478,13 +487,15 @@ def main():
         from handtrack.merctrack import MercuryTracker
         merc_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
                                         initializer=mpworker.init_mercury_proc,
-                                        initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket, a.merc_model))
+                                        initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket, a.merc_model,
+                                                  a.merc_s3d_model, a.merc_cell_offset))
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched
         mt.predict_roi = a.merc_predict_roi
         mt.stereo_ms = a.merc_stereo_ms
         mt.views = a.merc_views
+        mt.s3d_curls = a.merc_s3d_curls
         mt.stereo_comp = a.merc_stereo_comp == "on"
         mt.curl_latest = a.curl_latest
         mt.curl_geo = [FINGERS.index(f) for f in a.curl_geo_fingers.split(",") if f]
@@ -754,6 +765,8 @@ def main():
                 merc_raw = crop_is_raw(pv["merc_crop"] or a.merc_crop)
                 if mt is not None:
                     mt.views = pv["merc_views"] or a.merc_views
+                    if mt.views == "stereo3d" and not a.merc_s3d_model:
+                        mt.views = "alternate"                 # no 3D student loaded: the profile cannot select it
                     mt.stereo_comp = (a.merc_stereo_comp == "on") if pv["stereo_comp"] is None else pv["stereo_comp"]
                 if tel is not None:   # profile switch marker: the report can split results by profile
                     tel.write("P,%d,%s" % (time.monotonic_ns(), ";".join(

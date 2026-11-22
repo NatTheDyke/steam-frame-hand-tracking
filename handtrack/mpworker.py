@@ -55,7 +55,8 @@ def init_mercury():
     return _merc
 
 
-def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, model=None):
+def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, model=None, s3d_model=None,
+                      cell_offset=0.5):
     """Initializer for the dedicated Mercury worker process (no MediaPipe in it)."""
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(v, "1")
@@ -64,13 +65,70 @@ def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, mode
         os.nice(10)
     except (AttributeError, OSError):
         pass
-    global _merc_config, _merc_model
+    global _merc_config, _merc_model, _s3d_model
     if model:
         _merc_model = model
-    _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs, npu_socket=npu_socket)
+    if s3d_model:
+        _s3d_model = s3d_model
+    _merc_config = dict(inference=inference, framenpu_jobs=framenpu_jobs, npu_socket=npu_socket, cell_offset=cell_offset)
     init_mercury()
     from multiprocessing.util import Finalize
     Finalize(None, close_mercury, exitpriority=10)
+
+
+_s3d = None
+_s3d_model = None
+_s3d_geo = None
+
+
+def init_stereo3d():
+    """the 3D stereo student (views = stereo3d) and the camera-to-camera transform, lazily"""
+    global _s3d, _s3d_geo
+    if _s3d is None:
+        if not _s3d_model:
+            raise RuntimeError("views stereo3d needs a 3D stereo student (--merc-s3d-model)")
+        from handtrack import stereo3d
+        from handtrack.calib import Rig
+        from handtrack import source as camsource
+        _s3d = stereo3d.Stereo3D(os.path.expanduser(_s3d_model))
+        rig, src = Rig(), camsource.active()
+        slot_of = {n: s for s, n in src.slot_cams.items()}
+        v = [slot_of[n] for n in stereo3d.VIEW_CAMS]
+        (R0, o0), (R1, o1) = (rig.head_from_cam(n) for n in stereo3d.VIEW_CAMS)
+        _s3d_geo = (v, R1.T @ R0, R1.T @ (o0 - o1))
+    return _s3d, _s3d_geo
+
+
+def run_stereo3d(jobs, imgs, raw=False):
+    """jobs: [(side, {slot: joints_cv (21,3)} for both cameras, expand, use_hint)]: both crops of each
+    hand from the same capture -> the keypoint model on both (one request of 2 crops) and the 3D
+    stereo student on the pair. Returns [(side, {slot: decoded result or None}, joints3d in view 0's
+    camera (OpenCV) or None, is_hand_3d, view0_slot, seconds, timing)]."""
+    import time
+    mk = init_mercury()
+    s3d, (views, R10, t10) = init_stereo3d()
+    out = []
+    for side, jcs, expand, use_hint in jobs:
+        s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
+        right = side == "right"
+        preps = {sl: mk._prepare(sl, imgs[sl], jcs[sl], right, use_hint=use_hint, expand=expand, raw=raw) for sl in views}
+        valid = [sl for sl in views if preps[sl] is not None]
+        outputs = mk.backend.infer([preps[sl][-1] for sl in valid]) if valid else []
+        res = {sl: None for sl in views}
+        for sl, o in zip(valid, outputs):
+            r = mk._decode(preps[sl], o)
+            r.pop("crop", None)
+            res[sl] = r
+        timing = (getattr(mk.backend, "last_timing", None) or {}) if valid else {}
+        J3, p3 = None, 0.0
+        if all(preps[sl] is not None for sl in views):
+            J3, p3 = s3d.run(preps[views[0]], preps[views[1]], jcs[views[0]], right, R10, t10)
+        dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
+        out.append((side, res, J3, p3, views[0], dsec,
+                    {"t0": t0, "t1": t1, "cpu_ns": s1[0] - s0[0], "wait_ns": s1[1] - s0[1], "hint": use_hint,
+                     "batch_crops": len(valid), "inference": mk.backend.name,
+                     "request_crops": timing.get("crops", len(valid)), "dsp_body_ms": timing.get("body_ms", 0.0)}))
+    return out
 
 
 def idle_mercury():

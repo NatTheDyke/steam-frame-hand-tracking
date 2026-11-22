@@ -14,6 +14,9 @@ one instant.  "alternate" (the original) crops one camera per frame and triangul
 other camera's previous result, captured a frame earlier: a moving hand has moved between the two
 views, which puts a triangulated palm 2-7 cm off at 0.3-0.6 m/s (more at distance) and tilts the
 palm when the wrist turns.  "auto" = both when inference is on the NPU, alternate on the CPU.
+"stereo3d" (handtrack/stereo3d.py): both cameras of the same pair for every hand, FeatureNN-style --
+the keypoint model on both crops (same-instant triangulation) plus a 3D stereo student on the pair;
+the 3D hand shape is placed on the triangulated palm centre.
 With stereo_comp the older view's rays are shifted by the palm's motion since its capture
 (from the 60 Hz two-camera palm positions), which removes the translation part of that error.
 
@@ -23,6 +26,7 @@ import time
 
 import numpy as np
 
+from handtrack import stereo3d
 from handtrack.calib import triangulate
 from handtrack.palm import PALM_IDX, finger_curls
 
@@ -77,7 +81,9 @@ class MercuryTracker:
         self.sched = "batch"                      # "batch": all hands in one job (original);
                                                   # "perhand": one hand per job on the newest frame,
                                                   # least recently serviced hand first
-        self.views = "auto"                       # "both" | "alternate" | "auto" (module docstring)
+        self.views = "auto"                       # "both" | "alternate" | "auto" | "stereo3d" (module docstring)
+        self.s3d_curls = "geometric"              # stereo3d: curls from the joints ("geometric") or the keypoint model ("mercury")
+        self.job_kind = None                      # "s3d" while a stereo3d job is in flight
         self.stereo_comp = True                   # shift an older view's rays by the palm motion since its capture
         self.last_inference = "cpu"               # backend of the last result (views = auto)
         self.collapsed = None
@@ -122,6 +128,8 @@ class MercuryTracker:
         Mercury crops from these at full resolution; imgs (detector images) still seed the flow."""
         if self.job is not None or not self.hands:
             return False
+        if self.views == "stereo3d":
+            return self._submit_s3d(imgs, t_cap_ns, fast_pos, anchor_pos, info, raw_imgs)
         jobs = []
         sides = list(self.hands)
         if self.sched == "perhand":
@@ -188,6 +196,8 @@ class MercuryTracker:
         Returns {side: (pose tuple, slot, det_px, t_capture_s, image_the_crop_came_from)}."""
         if self.job is None or not self.job[0].done():
             return {}
+        if self.job_kind == "s3d":
+            return self._collect_s3d()
         fut, t_ns, fast_pos, job_imgs, t_sub_ns, njob = self.job
         info = self.job_info
         self.job, self.job_info = None, {}
@@ -307,6 +317,148 @@ class MercuryTracker:
             if t - self.hands[side].t > LOST_AFTER_S:
                 del self.hands[side]
         # collapse guard: both trackers on the same physical hand -> drop the newer track, re-discover
+        self.collapsed = None
+        if len(self.hands) == 2:
+            L, R = self.hands["left"], self.hands["right"]
+            if np.linalg.norm(self.palm_c(L.P) - self.palm_c(R.P)) < COLLAPSE_M:
+                drop = "left" if L.created > R.created else "right"
+                del self.hands[drop]
+                out.pop(drop, None)
+                self.collapsed = drop
+                self.stats["collapses"] = self.stats.get("collapses", 0) + 1
+        return out
+
+    # ---- views = "stereo3d" (handtrack/stereo3d.py) -------------------------------------------------
+    def _submit_s3d(self, imgs, t_cap_ns, fast_pos, anchor_pos, info, raw_imgs):
+        """both cameras' crops of every tracked hand from THIS pair (the cameras expose together);
+        placement = the hand's joints moved with the 60 Hz palm position, as in submit()."""
+        sides = list(self.hands)
+        if self.sched == "perhand":
+            sides = [min(sides, key=lambda sd: self.hands[sd].last_submit)]
+        t_sub = time.monotonic()
+        jobs = []
+        for side in sides:
+            hs = self.hands[side]
+            hs.last_submit = t_sub
+            P = hs.P
+            fp = fast_pos.get(side)
+            if fp is not None:
+                P = P + (np.asarray(fp[0]) - P[PALM_IDX[:1] + [5, 9, 17]].mean(0))
+            elif self.predict_roi:
+                P = P + hs.vel * min(max(t_cap_ns / 1e9 - hs.t, 0.0), 0.15)
+            jcs = {}
+            for slot in (0, 1):
+                R, t = self.palm.pose[slot]
+                jcs[slot] = (P - t) @ R
+            if any((jc[:, 2] < 0.08).any() for jc in jcs.values()):
+                continue
+            hint = not (self.hint_reset and (hs.misses > 0 or fp is None))
+            jobs.append((side, jcs, None, hint))
+            hs.last_both = t_sub
+        if not jobs:
+            return False
+        self.idle_future = None
+        src = raw_imgs if raw_imgs is not None else imgs
+        fut = self.pool.submit(self.worker.run_stereo3d, jobs, {0: src[0], 1: src[1]}, raw_imgs is not None)
+        self.job = (fut, t_cap_ns, fast_pos, {0: imgs[0], 1: imgs[1]}, time.monotonic_ns(), 2 * len(jobs))
+        self.job_kind = "s3d"
+        self.job_info = dict(info or {})
+        return True
+
+    def _collect_s3d(self):
+        fut, t_ns, fast_pos, job_imgs, t_sub_ns, njob = self.job
+        info = self.job_info
+        self.job, self.job_info, self.job_kind = None, {}, None
+        t = t_ns / 1e9
+        t_col_ns = time.monotonic_ns()
+        try:
+            res = fut.result()
+        except Exception:
+            return {}
+        out = {}
+        for side, rs, J3, p3, v0, dsec, tim in res:
+            self.stats["runs"] += 1
+            self.stats["ms"].append(dsec * 1e3)
+            rec = {"id": self.next_id, "side": side, "slot": v0, "t_cap": t_ns, "t_sub": t_sub_ns,
+                   "t0": tim.get("t0", 0), "t1": tim.get("t1", 0), "cpu_ns": tim.get("cpu_ns", 0),
+                   "wait_ns": tim.get("wait_ns", 0), "t_col": t_col_ns, "njob": njob, "outcome": "rej", "rq": None,
+                   "hint": int(tim.get("hint", True)), "inference": tim.get("inference", "unknown"),
+                   "request_crops": tim.get("request_crops", 0), "dsp_body_ms": tim.get("dsp_body_ms", 0.0),
+                   "path": info.get("path", "frame"), "seq": info.get("seq", 0),
+                   "t_read": info.get("t_read", 0), "t_ready": info.get("t_ready", 0)}
+            self.next_id += 1
+            self.records.append(rec)
+            hs = self.hands.get(side)
+            if hs is None:
+                rec["outcome"] = "gone"
+                continue
+            self.last_inference = rec["inference"]
+            ok = {sl: r for sl, r in rs.items() if r is not None and r["is_hand"] >= 0.97}
+            if not ok:
+                self.stats["rejected"] += 1
+                hs.misses += 1
+                continue
+            rays_h = {}
+            for sl, r in ok.items():
+                R, o = self.palm.pose[sl]
+                rays_h[sl] = (o, r["rays"] @ R.T)
+                fpn = fast_pos.get(side)
+                hs.last_rays[sl] = (t, o, rays_h[sl][1], np.asarray(fpn[0], float) if fpn is not None else None)
+                hs.geo_views[sl] = (t, o, rays_h[sl][1], np.asarray(r["rel_depth"], float))
+                hs.curls_by_view[sl] = (t, np.asarray(r["curls"], float), np.asarray(r["curl_var"], float))
+            P_tri = None
+            if len(rays_h) == 2:
+                (oa, ra), (ob, rb) = rays_h[0], rays_h[1]
+                Pm, gap, s1, s2 = triangulate(np.broadcast_to(oa, ra.shape), ra, np.broadcast_to(ob, rb.shape), rb)
+                if np.median(gap) < 0.02 and (s1 > 0.05).all() and (s2 > 0.05).all():
+                    P_tri = Pm
+            P3h = None
+            if J3 is not None:
+                R0, o0 = self.palm.pose[v0]
+                P3h = J3 @ R0.T + o0
+            if P3h is not None and P_tri is not None:
+                P, rec["outcome"] = stereo3d.hybrid(P_tri, P3h), "s3d_hyb"
+            elif P3h is not None:
+                P, rec["outcome"] = P3h, "s3d"
+            elif P_tri is not None:
+                P, rec["outcome"] = P_tri, "stereo"
+            else:
+                self.stats["rejected"] += 1
+                hs.misses += 1
+                continue
+            width = float(np.linalg.norm(P[5] - P[17]))
+            jump = np.linalg.norm(self.palm_c(P) - self.palm_c(hs.P))
+            if not np.isfinite(P).all() or not 0.045 < width < 0.12 or (jump > 0.25 and t - hs.t < 0.2):
+                self.stats["rejected"] += 1
+                hs.misses += 1
+                rec["outcome"] = "jump"
+                continue
+            dtv = t - hs.t
+            if 0.005 < dtv < 0.2:
+                v = (self.palm_c(P) - self.palm_c(hs.P)) / dtv
+                sp = np.linalg.norm(v)
+                hs.vel = v * min(1.0, 6.0 / sp) if sp > 0 else v
+            else:
+                hs.vel = np.zeros(3)
+            hs.hand_size = 0.9 * hs.hand_size + 0.1 * float(np.linalg.norm(P[0] - P[9]))
+            hs.P, hs.t, hs.misses = P, t, 0
+            self.stats["accepted"] += 1
+            self.stats["stereo"] += 1
+            rec["rq"] = self.palm.raw_quat(side, P)
+            if self.s3d_curls == "geometric":
+                raw_curls = finger_curls(P)
+            else:
+                vs = [hs.curls_by_view[sl][1:] for sl in ok]
+                wsum = sum(1 / v for _, v in vs)
+                raw_curls = np.clip(-(sum(c / v for c, v in vs) / wsum) / np.array(CURL_SCALE), 0, 1)
+            curls = self.palm.curl_filt[side](raw_curls, t)
+            conf = max(r["is_hand"] for r in ok.values())
+            pose = self.palm._pose(side, P, t, conf=conf) + (curls,)
+            ks = v0 if v0 in ok else next(iter(ok))
+            out[side] = (pose, ks, ok[ks]["det_px"], t, job_imgs[ks])
+        for side in list(self.hands):
+            if t - self.hands[side].t > LOST_AFTER_S:
+                del self.hands[side]
         self.collapsed = None
         if len(self.hands) == 2:
             L, R = self.hands["left"], self.hands["right"]
