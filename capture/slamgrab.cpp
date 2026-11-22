@@ -104,6 +104,17 @@ static void dmaSync(int fd, uint64_t flags) {
     dma_buf_sync s{flags};
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);
 }
+
+// Controller-LED exposures are ~0.04 ms and nearly black; scene exposures are ms long.  Sparse mean
+// (about 1000 pixels) so a frame can be classified by content rather than by its timing alone.
+static bool darkFrame(const Pair &p) {
+    dmaSync(p.img.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+    uint64_t sum = 0, n = 0;
+    for (uint32_t y = 16; y < H; y += 32)
+        for (uint32_t x = 16; x < W; x += 32) { sum += p.img.map[y * W + x]; n++; }
+    dmaSync(p.img.fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    return sum < 8 * n;
+}
 static uint64_t metaTicks(const Pair &p) {
     dmaSync(p.meta.fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
     uint64_t v;
@@ -265,6 +276,7 @@ int main(int argc, char **argv) {
         uint64_t nScene[2] = {0, 0}, nLed[2] = {0, 0}, nTorn[2] = {0, 0}, nPub[2] = {0, 0}, frames[2] = {0, 0};
         uint64_t nChangedLater = 0, nChecked = 0;
         uint64_t lastSceneTicks[2] = {0, 0}, lagNs = 5000000, lagMin = UINT64_MAX;   // lag: first guess 5 ms
+        double scenePeriodNs = 33333333.0;   // measured scene-frame period (33.3 ms, or 8.3 ms at 120 Hz)
         std::vector<double> ages, copyMs;
         uint64_t statT = monoNs(), offT = statT;
         while (!gStop) {
@@ -285,8 +297,14 @@ int main(int argc, char **argv) {
                 if (t <= lastTicks[cam]) continue;
                 double gapMs = lastTicks[cam] ? (t - lastTicks[cam]) * 1e3 / frq : 1e9;
                 lastTicks[cam] = t;
-                if (gapMs < 12.0) { nLed[cam]++; continue; }      // LED exposure 8.38 ms after scene
+                // LED exposure 8.38 ms after scene.  With controller tracking off (XRService 120 Hz SLAM mode)
+                // every frame is a scene frame 8.3 ms apart, so only a dark frame counts as an LED frame.
+                if (gapMs < 12.0 && darkFrame(pairs[i])) { nLed[cam]++; continue; }
                 nScene[cam]++;
+                if (lastSceneTicks[cam]) {
+                    double per = (t - lastSceneTicks[cam]) * 1e9 / frq;
+                    if (per > 4e6 && per < 50e6) scenePeriodNs = scenePeriodNs * 0.9 + per * 0.1;
+                }
                 lastSceneTicks[cam] = t;
                 uint64_t capNs = (uint64_t)llround((double)t * 1e9 / frq) - off;
                 {   // capture -> timestamp-visible lag (min over a window), used to time the next wake-up
@@ -368,7 +386,7 @@ int main(int argc, char **argv) {
             // (polling 32 timestamps each ms cost ~19% of a core).
             uint64_t sleepNs = 1000000;
             if (!check && lastSceneTicks[0] && lastSceneTicks[0] == lastSceneTicks[1]) {
-                uint64_t dueNs = (uint64_t)llround((double)lastSceneTicks[0] * 1e9 / frq) - off + 33333333ull + lagNs;
+                uint64_t dueNs = (uint64_t)llround((double)lastSceneTicks[0] * 1e9 / frq) - off + (uint64_t)scenePeriodNs + lagNs;
                 uint64_t nowNs = monoNs();
                 if (dueNs > nowNs + 3000000) sleepNs = dueNs - nowNs - 2000000;
                 if (sleepNs > 40000000) sleepNs = 1000000;   // stale estimate (cameras paused): plain polling
