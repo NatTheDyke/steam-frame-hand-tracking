@@ -343,6 +343,8 @@ def run_discover(frames, det_size, ncrop=2, tracked=None):
     like MediaPipe's. (While hands are tracked, discovery rides in run_mercury instead.)"""
     import time
     from handtrack import mercdet
+    from handtrack.framering import frames as _frames
+    frames = _frames(frames)          # a FrameRef (--frame-ring): views on the tracker's shared memory
     td = time.perf_counter()
     init_mercury()
     lay = mercdet.LAYOUTS[ncrop]
@@ -407,6 +409,8 @@ def run_mercury(jobs, imgs, raw=False, discover=None):
     the first group's service request -- and the return is {"obs": the list above, "discover":
     run_discover's result}."""
     import time
+    from handtrack.framering import frames
+    imgs = frames(imgs)               # a FrameRef (--frame-ring): views on the tracker's shared memory
     mk = init_mercury()
     out = []
     finish = None

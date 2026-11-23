@@ -67,6 +67,7 @@ class MercuryTracker:
         self.palm = palm                          # PalmTracker: pose[slot], _pose(), curl_filt
         self.pool = pool                          # dedicated ProcessPoolExecutor(1)
         self.worker = worker                      # module with run_mercury(jobs, imgs)
+        self.ring = None                          # framering.FrameRing: raw frames via shared memory (--frame-ring)
         self.hands = {}                           # side -> HandState
         self.job = None
         self.job_info = {}                        # submit path / capture seq / stage times of self.job
@@ -201,10 +202,18 @@ class MercuryTracker:
             disc.update(t_cap=t_cap_ns, det_imgs=dict(imgs))
             req = {k: disc[k] for k in ("pick", "ncrop", "det_size")}
             req["tracked"] = {sd: self.palm_c(hs.P) for sd, hs in self.hands.items()}
-            fut = self.pool.submit(self.worker.run_mercury, jobs, {s: raw_imgs[s] for s in (0, 1)}, True, req)
+            ref = self.ring.put(raw_imgs) if self.ring is not None else None
+            fut = self.pool.submit(self.worker.run_mercury, jobs,
+                                   ref if ref is not None else {s: raw_imgs[s] for s in (0, 1)}, True, req)
+            if ref is not None:
+                self.ring.release_when_done(ref, fut)
             self.job_disc = disc
         elif raw_imgs is not None:
-            fut = self.pool.submit(self.worker.run_mercury, jobs, {s: raw_imgs[s] for s in used}, True)
+            ref = self.ring.put(raw_imgs) if self.ring is not None else None
+            fut = self.pool.submit(self.worker.run_mercury, jobs,
+                                   ref if ref is not None else {s: raw_imgs[s] for s in used}, True)
+            if ref is not None:
+                self.ring.release_when_done(ref, fut)
         else:
             fut = self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used})
         self.job = (fut, t_cap_ns, fast_pos,
