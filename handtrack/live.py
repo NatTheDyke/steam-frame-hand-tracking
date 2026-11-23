@@ -698,8 +698,20 @@ def main():
                 if tel is not None:
                     tel.write("Z,%d,%s" % (time.monotonic_ns(), "stall" if adm.stalled(time.monotonic()) else blocked[0]))
 
-        def merc_collect():
-            """Mercury continuous tracking: collect a finished job and publish its observations."""
+        def reseed_flow(sl_m, side, px_m, img_m, cur_img, t_now, pos3d, P, t_m):
+            """Re-seed the fast tracker from a Mercury result (and v2: rebuild a lost camera view)."""
+            fast.seed(sl_m, side, types.SimpleNamespace(px=px_m), img_m, cur_img, t_now, pos3d=pos3d)
+            try:
+                fast.recover_view(side, P, t_m)               # v2: rebuild the other camera if lost
+            except Exception as e:                            # never let the experiment stop tracking
+                fast.stats["recover_error"] += 1
+                if fast.stats["recover_error"] == 1:
+                    print("flow v2 recover_view error: %r" % (e,), file=sys.stderr, flush=True)
+
+        def merc_collect(defer=None):
+            """Mercury continuous tracking: collect a finished job and publish its observations.
+            defer (a list): queue the fast-tracker re-seeds there (arguments bound now) instead of running
+            them, so --merc-preflow submits the next job first; the caller runs them before fast.step."""
             nonlocal next_merc, next_det, last_hand
             if mt is not None:
                 for side, (pose_m, sl_m, px_m, t_m, img_m) in mt.collect().items():
@@ -707,13 +719,11 @@ def main():
                         continue
                     slow[side], slow_t[side], slow_src[side] = pose_m, t_m, "merc"
                     slow_cam_q[side][sl_m] = (t_m, np.asarray(pose_m[1], float), "merc")
-                    fast.seed(sl_m, side, types.SimpleNamespace(px=px_m), img_m, imgs[sl_m], t_s, pos3d=pose_m[0])
-                    try:
-                        fast.recover_view(side, pose_m[3], t_m)   # v2: rebuild the other camera if lost
-                    except Exception as e:                        # never let the experiment stop tracking
-                        fast.stats["recover_error"] += 1
-                        if fast.stats["recover_error"] == 1:
-                            print("flow v2 recover_view error: %r" % (e,), file=sys.stderr, flush=True)
+                    args_ = (sl_m, side, px_m, img_m, imgs[sl_m], t_s, pose_m[0], pose_m[3], t_m)
+                    if defer is None:
+                        reseed_flow(*args_)
+                    else:
+                        defer.append(args_)
                     last_hand = time.monotonic()
                     if tel is not None:
                         tel.write("K,%d,%s,%d" % (int(t_m * 1e9), side, sl_m))
@@ -861,10 +871,12 @@ def main():
             frame_t = {"t_read": time.monotonic_ns()}
             frame_no += 1
             have_frame = True
+            reseeds = []
             if preflow:
                 # a finished job lands on the previous processed frame (its images, flow and time), as a
-                # between-frames collect does, so the next one can be submitted on this capture right away
-                merc_collect()
+                # between-frames collect does, so the next one can be submitted on this capture right away;
+                # its fast-tracker re-seeds wait until after that submit (still before this frame's flow)
+                merc_collect(defer=reseeds)
             t_raw = min(r0[1], r1[1])
             adopted = grid.adopted
             t_cap = grid.update(t_raw)
@@ -872,7 +884,6 @@ def main():
                 print("camera frame period: %.2f ms measured (source nominal %.2f ms)"
                       % (grid.adopted / 1e6, src.period_ns / 1e6), file=sys.stderr, flush=True)
             t_s = t_cap / 1e9
-            imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
             raw_frames = {0: r0[2], 1: r1[2]} if merc_raw else None
             pub_frames = {0: r0[2], 1: r1[2]}
             preflow_sub = False
@@ -882,6 +893,10 @@ def main():
                 merc_admit(False, path="preflow", pending=True)
                 merc_power()
                 preflow_sub = adm.submitted_seq != before_
+            for args_ in reseeds:
+                reseed_flow(*args_)
+            # this capture's detector images (after a --merc-preflow submit, which does not need them)
+            imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
 
             # ---- fast path: position every camera frame (every other frame when hot)
             tf = time.perf_counter()
