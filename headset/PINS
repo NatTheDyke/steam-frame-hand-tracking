@@ -1,0 +1,4 @@
+# The library set this tracker runs with: headset/install.sh installs exactly these wheels.
+# framenpu goes into both venvs (the root NPU service and the tracker), framehands into the tracker's.
+framenpu==0.2.0
+framehands==0.2.0

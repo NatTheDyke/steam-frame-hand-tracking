@@ -8,6 +8,7 @@
 # the compositor's real-time render thread (allowed 4-6) still preempts SCHED_IDLE work there.
 # HANDTRACK_CPUS=0-4 restores the previous placement.
 cd ~/handtrack/src
+export FRAMEHANDS_CORE=${FRAMEHANDS_CORE:-native}   # C++ geometry core (framehands._core); python = the reference
 R=$XDG_RUNTIME_DIR/mrhand; mkdir -p $R
 ARGS="$*"
 [ -z "$ARGS" ] && [ -f ~/handtrack/start_args ] && ARGS=$(cat ~/handtrack/start_args)
