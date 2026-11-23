@@ -52,7 +52,7 @@ from handtrack import source as camsource
 from handtrack.calib import triangulate
 from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
-from handtrack.mercsched import Admission, rate_cap_due
+from handtrack.mercsched import Admission, FrameGrid, rate_cap_due
 from handtrack.palm import PALM_IDX, Bridge, OneEuro, PalmTracker
 
 SHM = "/dev/shm/mrhand-pt"
@@ -405,6 +405,16 @@ def main():
                          "perhand: one hand per job on the newest frame, published as soon as it is done")
     ap.add_argument("--discover-hz", type=float, default=2.0,
                     help="with --backend mercury: MediaPipe rate while Mercury is tracking a hand")
+    ap.add_argument("--discover", choices=("mediapipe", "mercury"), default="mediapipe",
+                    help="hand discovery: MediaPipe (default), or Mercury's hand detector in the Mercury worker "
+                         "(needs --backend mercury; both cameras per run, answers kept when the cameras agree, "
+                         "seeded by keypoint crops; handtrack/mercdet.py)")
+    ap.add_argument("--det-crops", type=int, choices=(1, 2, 4), default=2,
+                    help="with --discover mercury: detector crops per camera per run")
+    ap.add_argument("--det-model", default=None,
+                    help="with --discover mercury: the detector ONNX for the CPU (default: "
+                         "~/handtrack/models/mercury/grayscale_detection_160x160.onnx); the NPU service's own "
+                         "--det-model is used when it serves one")
     ap.add_argument("--mercury-shadow", action="store_true",
                     help="also run Mercury's keypoint model on each stereo MediaPipe frame and log the comparison")
     ap.add_argument("--fast-orient", action="store_true",
@@ -431,6 +441,10 @@ def main():
         ap.error("--merc-model needs --merc-inference cpu")
     if a.merc_inference == "framenpu" and a.backend != "mercury":
         ap.error("--merc-inference framenpu requires --backend mercury")
+    if a.discover == "mercury" and a.backend != "mercury":
+        ap.error("--discover mercury requires --backend mercury")
+    if a.discover == "mercury" and a.mercury_shadow:
+        ap.error("--mercury-shadow compares against MediaPipe discovery")
     import handtrack.fasttrack as _ft
     _ft.MAX_SPEED = a.max_speed
     _ft.LK["maxLevel"] = a.lk_levels
@@ -468,10 +482,10 @@ def main():
     # inverting them swapped the hands), so keep them as-is (mirrored=True = no inversion).
     # MediaPipe runs in its own process (handtrack/mpworker.py) so it can never stall the 60 Hz loop
     import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import Future, ProcessPoolExecutor
     from handtrack import mpworker
-    mp_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
-                                  initializer=mpworker.init, initargs=(a.gpu, True))
+    mp_pool = None if a.discover == "mercury" else ProcessPoolExecutor(
+        1, mp_context=multiprocessing.get_context("spawn"), initializer=mpworker.init, initargs=(a.gpu, True))
     dets = None
     viewer = None if a.no_http else Viewer()
     if viewer:
@@ -488,7 +502,7 @@ def main():
         merc_pool = ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"),
                                         initializer=mpworker.init_mercury_proc,
                                         initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket, a.merc_model,
-                                                  a.merc_s3d_model, a.merc_cell_offset))
+                                                  a.merc_s3d_model, a.merc_cell_offset, a.det_model))
         mt = MercuryTracker(palm, merc_pool, mpworker)
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched
@@ -610,13 +624,14 @@ def main():
         slow_src = {}        # side -> backend of the latest articulated observation ("merc" / "mp")
         last_sent = {}       # side -> (t, position) last sent to the PC
         last_pkt = [None]    # (poses, ages, t_cap sent) of the last frame packet (curl-only re-sends)
-        grid_t, grid_period = None, src.period_ns                    # camera frame grid (ns)
+        grid = FrameGrid(src.period_ns)                              # camera frame grid (ns)
         rot_pending = {}     # side -> (t, quat) orientation outlier awaiting confirmation
         shown = {0: None, 1: None}
         job = None           # (future, kind, slot, imgs_at_detection, t_cap)
         shadow = None        # Mercury shadow comparison in flight
         next_merc = 0.0
         next_det = 0.0
+        det_pick = 0         # --discover mercury ride-along: the next crop position
         k = 0
         frame_no = 0
         last_hand = 0.0
@@ -705,7 +720,7 @@ def main():
             """Submit the next job on the newest processed frame (imgs / t_cap / fast_pos) if admitted.
             Blocked admission (no tracked hand, stalled cameras, thermal pause, no placeable crop) is
             not marked active, so merc_power() releases held power after the grace period."""
-            nonlocal next_merc
+            nonlocal next_merc, next_det
             if mt is None:
                 return
             now = time.monotonic()
@@ -715,7 +730,7 @@ def main():
             if not mt.tracked() or adm.stalled(now):
                 blocked[0] = "untracked" if not mt.tracked() else "stall"
                 return
-            if not rate_cap_due(now, next_merc, grid_period / 1e9):
+            if not rate_cap_due(now, next_merc, grid.period / 1e9):
                 adm.active(now)                     # rate cap: still tracking
                 return
             # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
@@ -724,7 +739,7 @@ def main():
             if iv is None:
                 blocked[0] = "thermal"
                 return
-            if not adm.admissible(now, grid_period / 1e9, between_frames):
+            if not adm.admissible(now, grid.period / 1e9, between_frames):
                 adm.active(now)                     # this capture was used (or is stale): next frame
                 return
             # v2: Mercury anchors single-view depth only to a two-camera position, never to a held
@@ -738,6 +753,9 @@ def main():
                 next_merc = now + iv
             else:
                 blocked[0] = "unplaceable"          # no crop in front of either camera
+                # no job will come back to drop a hand that stays unplaceable: drop it once it is lost
+                if mt.expire(t_s):
+                    next_det = 0.0
 
 
         hands_cfg = EnabledHands()
@@ -812,19 +830,15 @@ def main():
             frame_no += 1
             have_frame = True
             t_raw = min(r0[1], r1[1])
-            if grid_t is None or abs(t_raw - grid_t) > 1e9:
-                grid_t = t_raw
-            else:
-                nfr = max(1, round((t_raw - grid_t) / grid_period))
-                pred = grid_t + nfr * grid_period
-                resid = t_raw - pred
-                grid_t = pred + 0.05 * resid                       # follow phase slowly
-                grid_period += 0.002 * resid / nfr                 # and the true frame period
-                grid_period = min(max(grid_period, 0.9 * src.period_ns), 1.11 * src.period_ns)
-            t_cap = int(grid_t)
+            adopted = grid.adopted
+            t_cap = grid.update(t_raw)
+            if grid.adopted != adopted:
+                print("camera frame period: %.2f ms measured (source nominal %.2f ms)"
+                      % (grid.adopted / 1e6, src.period_ns / 1e6), file=sys.stderr, flush=True)
             t_s = t_cap / 1e9
             imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
             raw_frames = {0: r0[2], 1: r1[2]} if merc_raw else None
+            pub_frames = {0: r0[2], 1: r1[2]}
 
             # ---- fast path: position every camera frame (every other frame when hot)
             tf = time.perf_counter()
@@ -842,9 +856,23 @@ def main():
             if job and job[0].done():
                 fut, kind, slot, det_imgs, t_det = job
                 job = None
-                res = fut.result()                 # {slot: (hands, det_seconds)}
+                if t_det is None:                  # a ride-along discovery: its capture is the tracking job's
+                    det_imgs, t_det = det_imgs.get("det_imgs"), det_imgs.get("t_cap")
+                    if det_imgs is None:           # never attached (it failed before a submit)
+                        det_imgs, t_det = dict(imgs), t_cap
+                try:
+                    res = fut.result()             # {slot: (hands, det_seconds)}
+                except Exception as e:             # noqa: BLE001 -- a failed Mercury discovery finds nothing
+                    if kind != "mdet":
+                        raise
+                    print("mercury discovery error: %r" % (e,), file=sys.stderr, flush=True)
+                    res = {0: ([], 0.0), 1: ([], 0.0)}
                 hands_by_slot = {sl: v[0] for sl, v in res.items()}
-                if kind == "stereo":
+                if kind == "mdet":
+                    # Mercury-detector discovery: both cameras' records carry the same triangulated joints
+                    poses_d = palm.fuse(hands_by_slot[0], hands_by_slot[1], t_det / 1e9)
+                    merr = []
+                elif kind == "stereo":
                     poses_d = palm.fuse(hands_by_slot[0], hands_by_slot[1], t_det / 1e9)
                     merr = mono_vs_stereo(poses_d, hands_by_slot[1])
                     if a.mercury_shadow and shadow is None:
@@ -913,7 +941,7 @@ def main():
                                 rot_pending[side] = (t_s, qn)      # likely a bad result: wait for a second one
                                 accept = False
                     if accept:
-                        for sl in ((0, 1) if kind == "stereo" else (slot,)):
+                        for sl in ((0, 1) if kind in ("stereo", "mdet") else (slot,)):
                             slow_cam_q[side][sl] = (t_det / 1e9, qn, "mp")
                     # seed the optical-flow tracker with the detection that is geometrically ON this hand
                     pc3 = p[3][[0, 5, 9, 17]].mean(0)
@@ -982,6 +1010,9 @@ def main():
 
             # ---- schedule the next MediaPipe run (rate cap, thermal guard, idle mode)
             now_m = time.monotonic()
+            if job is not None and job[4] is None and mt.discover_req is job[3] and now_m - job[3]["t_req"] > 0.2:
+                # no tracking job carried the ride-along discovery (the hands were lost): run it standalone
+                mt.discover_req, job, next_det = None, None, 0.0
             lost = set(fast.lost)
             if job is None and (now_m >= next_det or lost):
                 interval = thermal.interval(a.max_hz)
@@ -1000,8 +1031,26 @@ def main():
                     det_imgs = dict(imgs)
                     use = (0, 1) if stereo else (slot,)
 
-                    fut = mp_pool.submit(mpworker.run, use, {sl: det_imgs[sl] for sl in use}, t_cap / 1e9)
-                    job = (fut, "stereo" if stereo else "mono", slot, det_imgs, t_cap)
+                    riding = mt.tracked() and mt.last_submit_t is not None and now_m - mt.last_submit_t < 0.1
+                    if a.discover == "mercury" and riding and merc_raw and mt.views != "stereo3d":
+                        # hands are tracked and their jobs are going out: discovery rides in the next
+                        # tracking job (same capture, one service request), never queued ahead of it; one
+                        # crop position per run, in turn. (A tracked hand with no job submitted lately --
+                        # one that cannot be placed -- must not hold discovery back: standalone then.)
+                        fut = Future()
+                        mt.discover_req = dict(future=fut, pick=det_pick, ncrop=a.det_crops, det_size=a.size,
+                                               t_req=now_m)
+                        det_pick += 1
+                        job = (fut, "mdet", slot, mt.discover_req, None)
+                    elif a.discover == "mercury":
+                        # nothing tracked: a standalone run with every crop position (the one NPU-service
+                        # client is the Mercury worker, so it runs there)
+                        fut = merc_pool.submit(mpworker.run_discover, pub_frames, a.size, a.det_crops,
+                                               {sd: mt.palm_c(h.P) for sd, h in mt.hands.items()})
+                        job = (fut, "mdet", slot, det_imgs, t_cap)
+                    else:
+                        fut = mp_pool.submit(mpworker.run, use, {sl: det_imgs[sl] for sl in use}, t_cap / 1e9)
+                        job = (fut, "stereo" if stereo else "mono", slot, det_imgs, t_cap)
 
             # ---- compose and send: fast position + latest orientation / curls
             # (a frame skipped for heat sends nothing: no old state relabelled as new)
@@ -1170,7 +1219,8 @@ def main():
                 merc_pool.submit(mpworker.close_mercury).result()
             finally:
                 merc_pool.shutdown(wait=True)
-        mp_pool.shutdown(wait=True)
+        if mp_pool is not None:
+            mp_pool.shutdown(wait=True)
         pool.shutdown(wait=True)
 
 

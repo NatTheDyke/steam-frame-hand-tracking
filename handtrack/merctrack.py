@@ -84,6 +84,12 @@ class MercuryTracker:
         self.views = "auto"                       # "both" | "alternate" | "auto" | "stereo3d" (module docstring)
         self.s3d_curls = "geometric"              # stereo3d: curls from the joints ("geometric") or the keypoint model ("mercury")
         self.job_kind = None                      # "s3d" while a stereo3d job is in flight
+        # Mercury-detector discovery waiting to ride in the next tracking job (live.py sets it:
+        # {future, pick, ncrop, det_size}; submit adds t_cap, det_imgs and the tracked palms, and
+        # collect resolves the future with run_discover's result)
+        self.discover_req = None
+        self.job_disc = None
+        self.last_submit_t = None                 # time.monotonic() of the last submitted tracking job
         self.stereo_comp = True                   # shift an older view's rays by the palm motion since its capture
         self.last_inference = "cpu"               # backend of the last result (views = auto)
         self.collapsed = None
@@ -113,6 +119,15 @@ class MercuryTracker:
 
     def busy(self):
         return self.job is not None
+
+    def expire(self, t):
+        """Drop hands with no accepted observation for LOST_AFTER_S at capture time t (s), as collect
+        does. For a hand no crop can be placed for (behind / too close to both cameras), no job
+        comes back to drop it, so it would stay tracked indefinitely. Returns the dropped sides."""
+        gone = [sd for sd, hs in self.hands.items() if t - hs.t > LOST_AFTER_S]
+        for sd in gone:
+            del self.hands[sd]
+        return gone
 
     def idle(self):
         """Queue one power release after the current observations finish."""
@@ -180,7 +195,15 @@ class MercuryTracker:
             return False
         self.idle_future = None
         used = sorted({j[0] for j in jobs})
-        if raw_imgs is not None:
+        disc, self.job_disc = self.discover_req, None
+        if disc is not None and raw_imgs is not None:
+            self.discover_req = None
+            disc.update(t_cap=t_cap_ns, det_imgs=dict(imgs))
+            req = {k: disc[k] for k in ("pick", "ncrop", "det_size")}
+            req["tracked"] = {sd: self.palm_c(hs.P) for sd, hs in self.hands.items()}
+            fut = self.pool.submit(self.worker.run_mercury, jobs, {s: raw_imgs[s] for s in (0, 1)}, True, req)
+            self.job_disc = disc
+        elif raw_imgs is not None:
             fut = self.pool.submit(self.worker.run_mercury, jobs, {s: raw_imgs[s] for s in used}, True)
         else:
             fut = self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used})
@@ -189,6 +212,7 @@ class MercuryTracker:
         if anchor_pos is not None:
             self.job = self.job[:2] + (anchor_pos,) + self.job[3:]
         self.job_info = dict(info or {})
+        self.last_submit_t = t_sub
         return True
 
     def collect(self):
@@ -201,12 +225,18 @@ class MercuryTracker:
         fut, t_ns, fast_pos, job_imgs, t_sub_ns, njob = self.job
         info = self.job_info
         self.job, self.job_info = None, {}
+        disc, self.job_disc = self.job_disc, None
         t = t_ns / 1e9
         t_col_ns = time.monotonic_ns()
         try:
             res = fut.result()
-        except Exception:
+        except Exception as exc:
+            if disc is not None:
+                disc["future"].set_exception(exc)
             return {}
+        if disc is not None:
+            disc["future"].set_result(res["discover"])
+            res = res["obs"]
         out = {}
         def valid(r):
             return r is not None and r["is_hand"] >= 0.97

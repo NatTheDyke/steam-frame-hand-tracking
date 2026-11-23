@@ -107,23 +107,46 @@ class FallbackBackend:
         except Exception as cleanup:
             LOG.warning("FrameNPU cleanup retained device state: %s", cleanup)
 
+    @staticmethod
+    def _check(out, n):
+        if len(out) != n:
+            raise ValueError("FrameNPU returned the wrong crop count")
+        for crop in out:
+            for name, shape in zip(OUTPUTS, SHAPES):
+                v = np.asarray(crop[name])
+                if v.shape != shape or not np.isfinite(v).all():
+                    raise ValueError("FrameNPU returned invalid " + name)
+        return out
+
     def infer(self, feeds):
         if not 1 <= len(feeds) <= 3:
             raise ValueError("inference calls carry one to three crops")
         if self.accelerator is not None:
             try:
-                out = self.accelerator.infer(feeds)
-                if len(out) != len(feeds):
-                    raise ValueError("FrameNPU returned the wrong crop count")
-                for crop in out:
-                    for name, shape in zip(OUTPUTS, SHAPES):
-                        v = np.asarray(crop[name])
-                        if v.shape != shape or not np.isfinite(v).all():
-                            raise ValueError("FrameNPU returned invalid " + name)
-                return out
+                return self._check(self.accelerator.infer(feeds), len(feeds))
             except Exception as exc:
                 self._disable(exc)
         return self.cpu.infer(feeds)
+
+    def infer_frame(self, feeds, extra):
+        """Keypoint crops (1..3) and extra = (service model, crops) in one service frame request (one
+        DSP job) -> (keypoint outputs, the extra request's outputs). The extra outputs are None
+        when the accelerator cannot take them along (no service, a service without infer_frame or
+        that model, or after a failure, which latches this worker to the CPU as infer does): the
+        caller runs that request itself."""
+        if not 1 <= len(feeds) <= 3:
+            raise ValueError("inference calls carry one to three crops")
+        client = getattr(self.accelerator, "client", None)
+        if client is None or getattr(client, "max_frame", 0) < 2 or extra[0] not in client.models:
+            return self.infer(feeds), None
+        try:
+            out, ex = client.infer_frame([(0, feeds), extra])
+            if len(ex) != len(extra[1]):
+                raise ValueError("FrameNPU returned the wrong crop count")
+            return self._check(out, len(feeds)), ex
+        except Exception as exc:
+            self._disable(exc)
+        return self.cpu.infer(feeds), None
 
     def idle(self):
         if self.accelerator is not None:

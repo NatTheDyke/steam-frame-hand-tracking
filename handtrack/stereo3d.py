@@ -59,8 +59,29 @@ def hybrid(P_tri, P_3d):
     return P_3d - P_3d[HYB_PALM].mean(0) + P_tri[HYB_PALM].mean(0)
 
 
+def feeds(prep0, prep1, place0, right, R10, t10):
+    """prep_k = MercuryKeypoint._prepare() of view k (slot, img, q, r, flip, feeds); place0 the
+    placement joints in camera 0 (OpenCV) -> (the student's feeds, A0, c0)"""
+    f0, f1 = prep0[5], prep1[5]
+    x = np.concatenate([f0["inputImg"], f1["inputImg"]], 1).astype(np.float32)
+    use = f0["useLastKeypoints"]
+    hint = np.concatenate([f0["lastKeypoints"], f1["lastKeypoints"]], 1).astype(np.float32) * use[0]
+    geom, A0, c0 = pair_geometry(prep0[2], prep1[2], float(prep0[3]), float(prep1[3]), right, place0, R10, t10)
+    return ({"inputImg": x, "lastKeypoints": hint, "useLastKeypoints": use.astype(np.float32), "geom": geom[None]},
+            A0, c0)
+
+
+def finish(named, A0, c0):
+    """the student's outputs (joints3d, scalar_extras) -> (joints (21,3) camera 0 OpenCV, is_hand)"""
+    y = np.asarray(named["joints3d"], np.float64).reshape(21, 3)
+    ex = named.get("scalar_extras")
+    is_hand = float(1 / (1 + np.exp(-float(np.ravel(ex)[0])))) if ex is not None else 1.0
+    return from_y(y, A0, c0), is_hand
+
+
 class Stereo3D:
     """CPU ONNX Runtime session for the 3D stereo student (one pair per run)."""
+    name = "cpu"
 
     def __init__(self, model_path, threads=1):
         import onnxruntime as ort
@@ -73,17 +94,32 @@ class Stereo3D:
             raise ValueError("%s has no geom input: not a 3D stereo student" % model_path)
 
     def run(self, prep0, prep1, place0, right, R10, t10):
-        """prep_k = MercuryKeypoint._prepare() of view k (slot, img, q, r, flip, feeds); place0 the
-        placement joints in camera 0 (OpenCV). Returns (joints (21,3) camera 0 OpenCV, is_hand)."""
-        f0, f1 = prep0[5], prep1[5]
-        x = np.concatenate([f0["inputImg"], f1["inputImg"]], 1).astype(np.float32)
-        use = f0["useLastKeypoints"]
-        hint = np.concatenate([f0["lastKeypoints"], f1["lastKeypoints"]], 1).astype(np.float32) * use[0]
-        geom, A0, c0 = pair_geometry(prep0[2], prep1[2], float(prep0[3]), float(prep1[3]), right, place0, R10, t10)
-        out = self.sess.run(None, {"inputImg": x, "lastKeypoints": hint, "useLastKeypoints": use.astype(np.float32),
-                                   "geom": geom[None]})
-        named = dict(zip([o.name for o in self.sess.get_outputs()], out))
-        y = named["joints3d"].reshape(21, 3)
-        ex = named.get("scalar_extras")
-        is_hand = float(1 / (1 + np.exp(-float(ex[0][0])))) if ex is not None else 1.0
-        return from_y(y, A0, c0), is_hand
+        """Returns (joints (21,3) camera 0 OpenCV, is_hand)."""
+        f, A0, c0 = feeds(prep0, prep1, place0, right, R10, t10)
+        out = self.sess.run(None, f)
+        return finish(dict(zip([o.name for o in self.sess.get_outputs()], out)), A0, c0)
+
+
+class ServiceStereo3D:
+    """The 3D stereo student on the DSP through the NPU service (model 1 of the same client as the
+    keypoint model). Any failure latches to the CPU session for this worker's lifetime."""
+    name = "framenpu"
+
+    def __init__(self, client, cpu_factory):
+        self.client, self.cpu_factory, self.cpu = client, cpu_factory, None
+        self.last_timing = None
+
+    def run(self, prep0, prep1, place0, right, R10, t10):
+        if self.client is not None:
+            f, A0, c0 = feeds(prep0, prep1, place0, right, R10, t10)
+            try:
+                (named,) = self.client.infer([f], model=1)
+                self.last_timing = self.client.last_timing
+                return finish(named, A0, c0)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("3D student on the NPU disabled; using CPU: %s", exc)
+                self.client, self.name = None, "cpu"
+        if self.cpu is None:
+            self.cpu = self.cpu_factory()
+        return self.cpu.run(prep0, prep1, place0, right, R10, t10)

@@ -97,6 +97,45 @@ class BackendTests(unittest.TestCase):
             npu.assert_not_called()
 
 
+class FrameRequestTests(unittest.TestCase):
+    def backend(self, client):
+        accelerator = Mock()
+        accelerator.client = client
+        accelerator.infer.return_value = [outputs(1)]
+        return FallbackBackend(Mock(), lambda: accelerator), accelerator
+
+    def test_frame_request_carries_the_extra_crops(self):
+        client = Mock(max_frame=2, models=[0, 2])
+        client.infer_frame.return_value = [[outputs(2)], ["det"]]
+        backend, _ = self.backend(client)
+        kp, ex = backend.infer_frame(["a"], (2, ["d"]))
+        self.assertEqual(client.infer_frame.call_args.args[0], [(0, ["a"]), (2, ["d"])])
+        self.assertEqual((float(kp[0][OUTPUTS[0]].flat[0]), ex), (2.0, ["det"]))
+
+    def test_no_frame_support_runs_keypoints_alone(self):
+        for client in (None, Mock(max_frame=0, models=[0, 2]), Mock(max_frame=2, models=[0])):
+            backend, accelerator = self.backend(client)
+            kp, ex = backend.infer_frame(["a"], (2, ["d"]))
+            self.assertIsNone(ex)
+            self.assertEqual(accelerator.infer.call_args.args[0], ["a"])
+
+    def test_frame_failure_latches_to_cpu(self):
+        client = Mock(max_frame=2, models=[0, 2])
+        client.infer_frame.side_effect = RuntimeError("completion uncertain")
+        backend, _ = self.backend(client)
+        with self.assertLogs("handtrack.inference", "WARNING"):
+            kp, ex = backend.infer_frame(["a"], (2, ["d"]))
+        self.assertIsNone(ex)
+        self.assertEqual(backend.cpu.infer.call_args.args[0], ["a"])
+        self.assertEqual(backend.name, "cpu")
+        client.infer_frame.side_effect = None
+        client.infer_frame.return_value = [[outputs()], ["d"], ["x"]]
+        backend2, _ = self.backend(client)
+        client.infer_frame.return_value = [[outputs()], []]               # wrong extra count
+        with self.assertLogs("handtrack.inference", "WARNING"):
+            self.assertIsNone(backend2.infer_frame(["a"], (2, ["d"]))[1])
+
+
 class CropBatchTests(unittest.TestCase):
     def wrapper(self):
         mk = object.__new__(MercuryKeypoint)
@@ -183,6 +222,66 @@ class SchedulerTests(unittest.TestCase):
         tracker.idle()
         self.assertEqual(pool.submit.call_count, 2)
         self.assertIs(pool.submit.call_args.args[0], worker.idle_mercury)
+
+    def test_discovery_rides_in_the_next_tracking_job(self):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+        from handtrack.merctrack import MercuryTracker, HandState
+
+        pool, done = Mock(), Future()
+        pool.submit.return_value = done
+        palm = SimpleNamespace(pose={0: (np.eye(3), np.zeros(3)), 1: (np.eye(3), np.zeros(3))})
+        tracker = MercuryTracker(palm, pool, Mock())
+        joints = np.random.default_rng(4).normal(0, .01, (21, 3)) + [0, 0, .5]
+        tracker.hands["left"] = HandState("left", joints, 1.0)
+        want = Future()
+        tracker.discover_req = dict(future=want, pick=1, ncrop=2, det_size=640, t_req=0.0)
+        imgs, raw = {0: "d0", 1: "d1"}, {0: "r0", 1: "r1"}
+        self.assertTrue(tracker.submit(imgs, 10**9, {}, raw_imgs=raw))
+        args = pool.submit.call_args.args
+        self.assertEqual(args[2], raw)                     # both cameras, though one crop is tracked
+        self.assertEqual((args[3], args[4]["pick"], args[4]["ncrop"]), (True, 1, 2))
+        np.testing.assert_allclose(args[4]["tracked"]["left"], joints[[0, 5, 9, 17]].mean(0))
+        self.assertIsNone(tracker.discover_req)
+        self.assertEqual((tracker.job_disc["t_cap"], tracker.job_disc["det_imgs"]), (10**9, imgs))
+        done.set_result({"obs": [(1, "left", None, 0.01, {})], "discover": {0: ([], .01), 1: ([], .01)}})
+        tracker.collect()
+        self.assertEqual(want.result(0), {0: ([], .01), 1: ([], .01)})
+        self.assertEqual(len(tracker.records), 1)
+        # a failed job fails its discovery too; without raw frames nothing rides
+        failed, want2 = Future(), Future()
+        pool.submit.return_value = failed
+        tracker.discover_req = dict(future=want2, pick=0, ncrop=2, det_size=640, t_req=0.0)
+        tracker.submit(imgs, 2 * 10**9, {}, raw_imgs=raw)
+        failed.set_exception(RuntimeError("worker died"))
+        tracker.collect()
+        self.assertIsInstance(want2.exception(0), RuntimeError)
+        req = dict(future=Future(), pick=0, ncrop=2, det_size=640, t_req=0.0)
+        tracker.discover_req = req
+        pool.submit.return_value = Future()
+        tracker.submit(imgs, 3 * 10**9, {})
+        self.assertEqual(len(pool.submit.call_args.args), 3)     # run_mercury, jobs, imgs: nothing rides
+        self.assertIs(tracker.discover_req, req)
+
+    def test_unplaceable_hand_expires_and_submit_time_is_kept(self):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+        from handtrack.merctrack import MercuryTracker, HandState, LOST_AFTER_S
+
+        pool = Mock()
+        pool.submit.return_value = Future()
+        palm = SimpleNamespace(pose={0: (np.eye(3), np.zeros(3)), 1: (np.eye(3), np.zeros(3))})
+        tracker = MercuryTracker(palm, pool, Mock())
+        behind = np.random.default_rng(5).normal(0, .01, (21, 3)) + [0, 0, -.3]
+        tracker.hands["right"] = HandState("right", behind, 1.0)
+        self.assertFalse(tracker.submit({0: np.zeros(1), 1: np.zeros(1)}, 10**9, {}))
+        self.assertIsNone(tracker.last_submit_t)
+        self.assertEqual(tracker.expire(1.0 + LOST_AFTER_S / 2), [])
+        self.assertEqual(tracker.expire(1.0 + 2 * LOST_AFTER_S), ["right"])
+        self.assertEqual(tracker.tracked(), set())
+        tracker.hands["left"] = HandState("left", behind * [1, 1, -1], 1.0)
+        self.assertTrue(tracker.submit({0: np.zeros(1), 1: np.zeros(1)}, 2 * 10**9, {}))
+        self.assertIsNotNone(tracker.last_submit_t)
 
     def test_records_carry_submit_path_sequence_and_stage_times(self):
         from concurrent.futures import Future
@@ -449,3 +548,53 @@ class GeometryParityTests(unittest.TestCase):
             for name in single:
                 np.testing.assert_array_equal(single[name], batch[name])
         mk.close()
+
+
+class FrameGridTests(unittest.TestCase):
+    @staticmethod
+    def old_grid(raws, nominal):
+        """the inline grid live.py had before FrameGrid"""
+        out, t, period = [], None, nominal
+        for r in raws:
+            if t is None or abs(r - t) > 1e9:
+                t = r
+            else:
+                nfr = max(1, round((r - t) / period))
+                pred = t + nfr * period
+                resid = r - pred
+                t = pred + 0.05 * resid
+                period += 0.002 * resid / nfr
+                period = min(max(period, 0.9 * nominal), 1.11 * nominal)
+            out.append(int(t))
+        return out
+
+    def frames(self, period, n, skip=(1,), seed=0):
+        rng = np.random.default_rng(seed)
+        k, out, true = 0, [], []
+        for _ in range(n):
+            k += int(rng.choice(skip))
+            true.append(1e12 + k * period)
+            out.append(int(true[-1] + rng.normal(0, 0.4e6)))
+        return out, np.array(true)
+
+    def test_30hz_is_the_old_grid(self):
+        from handtrack.mercsched import FrameGrid
+        raws, true = self.frames(1e9 / 30, 600, skip=(1, 1, 1, 2))
+        g = FrameGrid(1e9 / 30)
+        self.assertEqual([g.update(r) for r in raws], self.old_grid(raws, 1e9 / 30))
+        self.assertIsNone(g.adopted)
+
+    def test_120hz_mode_adopts_the_measured_period(self):
+        from handtrack.mercsched import FrameGrid
+        period = 1e9 / 114
+        for skip in ((1,), (1, 2, 2, 3), (2, 3), (3, 4)):   # every frame, or a loop that skips some / always
+            raws, true = self.frames(period, 900, skip=skip, seed=len(skip))
+            g = FrameGrid(1e9 / 30)
+            caps = np.array([g.update(r) for r in raws])
+            self.assertAlmostEqual(g.adopted / period, 1.0, delta=0.12)
+            err = np.abs(caps[100:] - true[100:])
+            self.assertLess(np.percentile(err, 95), 1.5e6, skip)
+            self.assertLess(abs(g.period - period) / period, 0.01, skip)
+        # the old grid ran ahead of real time at this rate
+        raws, true = self.frames(period, 300)
+        self.assertGreater(np.max(np.array(self.old_grid(raws, 1e9 / 30)) - true), 0.1e9)

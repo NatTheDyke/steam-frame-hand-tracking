@@ -22,6 +22,76 @@ Rules
 RATE_SLACK_FRACTION = 0.25  # rate cap: a capture may arrive this fraction of a frame period early
 
 
+class FrameGrid:
+    """Capture times on the camera's frame grid: the raw pair time (min of the two cameras') snapped
+    to a slowly following phase and period, so per-frame jitter does not reach the sent ages.
+
+    The period starts at the source's nominal one, but the cameras' real rate is measured: once
+    ADOPT_N intervals are in and the period they show (the camera period itself; a busy loop that
+    skips frames only adds multiples of it) is more than ADOPT_TOL away from the nominal period, that
+    becomes the nominal period and the grid restarts. XRService's 120 Hz SLAM mode (~114 usable
+    frames/s) otherwise ran the 33 ms grid ahead of real time by ~24 ms per frame."""
+    ADOPT_N = 24
+    ADOPT_TOL = 0.03             # the 30 Hz cameras run within 0.1% of nominal; the grid follows a wrong
+                                 # period only slowly (and not past its +-10% clamp)
+
+    def __init__(self, nominal_ns):
+        from collections import deque
+        self.nominal = self.period = float(nominal_ns)
+        self.t = None
+        self.prev = None
+        self.dts = deque(maxlen=64)
+        self.adopted = None          # the measured period (ns) once adopted
+
+    @staticmethod
+    def _fits(dts, p):
+        """99% of the sorted intervals are whole multiples of p, within a quarter of p (a doubled
+        period fits ~98% when the loop mostly gets every 2nd frame: the odd skips land half a period
+        off the grid)"""
+        res = sorted(abs(d - p * max(1, round(d / p))) for d in dts)
+        return res[int(0.99 * (len(res) - 1))] < 0.25 * p
+
+    @classmethod
+    def _period(cls, dts):
+        """The camera period behind sorted intervals: the largest p (the low end / k) they fit (a
+        loop that only ever skips 2 or 3 frames never shows one period directly), as the median of
+        each interval / its frame count."""
+        low = dts[len(dts) // 20]
+        for k in (1, 2, 3, 4):
+            p = low / k
+            if cls._fits(dts, p):
+                break
+        per = sorted(d / max(1, round(d / p)) for d in dts)
+        return per[len(per) // 2]
+
+    def update(self, t_raw):
+        """The newest pair's raw capture time (ns) -> its grid capture time (int ns)."""
+        if self.prev is not None and t_raw > self.prev:
+            self.dts.append(t_raw - self.prev)
+        self.prev = t_raw
+        if len(self.dts) >= self.ADOPT_N:
+            dts = sorted(self.dts)
+            # hysteresis: a measured period that still fits is kept (multiples of the period fit its
+            # halves too); the source's nominal period is not, since a loop that gets every 3rd-4th
+            # 114 Hz frame produces intervals that fit 33 ms
+            keep = self.adopted is not None and self._fits(dts, self.nominal)
+            low = self.nominal if keep else self._period(dts)
+            if abs(low - self.nominal) > self.ADOPT_TOL * self.nominal:
+                self.nominal = self.period = self.adopted = float(low)
+                self.t = None
+                self.dts.clear()
+        if self.t is None or abs(t_raw - self.t) > 1e9:
+            self.t = float(t_raw)
+        else:
+            nfr = max(1, round((t_raw - self.t) / self.period))
+            pred = self.t + nfr * self.period
+            resid = t_raw - pred
+            self.t = pred + 0.05 * resid                       # follow phase slowly
+            self.period += 0.002 * resid / nfr                 # and the true frame period
+            self.period = min(max(self.period, 0.9 * self.nominal), 1.11 * self.nominal)
+        return int(self.t)
+
+
 def rate_cap_due(now, next_t, period_s):
     """The Mercury rate cap (--merc-hz) allows a new submission at next_t (previous submission + the
     cap interval).  Camera frames arrive one period apart with ~1 ms jitter, so with the cap equal to
