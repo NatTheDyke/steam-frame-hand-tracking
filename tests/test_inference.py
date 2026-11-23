@@ -462,12 +462,13 @@ class UclampTests(unittest.TestCase):
 class GeometryParityTests(unittest.TestCase):
     def test_batch_preserves_crop_decode_and_observation_order(self):
         from types import SimpleNamespace
+        from framehands.calib import KBCamera
 
-        class Camera:
-            def project(self, rays):
-                return rays[:, :2] / rays[:, 2:] * 1000 + 1231.5
-
-        cam = Camera()
+        # a real camera of the kind the rig file gives (crops read its projection and distortion)
+        cam = KBCamera({"width": 640, "height": 640, "sourceCamera": "test",
+                        "intrinsics": {"fx": 300.0, "fy": 300.0, "cx": 319.5, "cy": 319.5,
+                                       "k1": 0.02, "k2": -0.01, "k3": 0.0, "k4": 0.0},
+                        "extrinsics": {"plus_x": [1, 0, 0], "plus_z": [0, 0, 1], "position": [0, 0, 0]}})
         mk = MercuryKeypoint(os.environ["FNPU_MERCURY_MODEL"],
                              SimpleNamespace(cams={"a": cam, "b": cam}), {0: "a", 1: "b"}, 640)
         rng = np.random.default_rng(63)
