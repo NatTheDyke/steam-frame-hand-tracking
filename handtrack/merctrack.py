@@ -9,7 +9,8 @@ optical-flow tracker when available, else to the previous state.  When the other
 for the same hand is fresh (< STEREO_MS), joints are triangulated instead.
 
 Views per hand (views): "both" crops the hand from both cameras of the same frame (at most
-MAX_CROPS crops per job; with two hands the second view takes turns), so stereo joints come from
+max_crops crops per job (MAX_CROPS = 3, or 4 with --merc-crops 4 on a 4-crop NPU image: both
+hands in both views); with two hands and three crops the second view takes turns), so stereo joints come from
 one instant.  "alternate" (the original) crops one camera per frame and triangulates against the
 other camera's previous result, captured a frame earlier: a moving hand has moved between the two
 views, which puts a triangulated palm 2-7 cm off at 0.3-0.6 m/s (more at distance) and tilts the
@@ -82,6 +83,8 @@ class MercuryTracker:
         self.sched = "batch"                      # "batch": all hands in one job (original);
                                                   # "perhand": one hand per job on the newest frame,
                                                   # least recently serviced hand first
+        self.max_crops = MAX_CROPS                # crops a job plans (4: --merc-crops 4; the worker
+                                                  # splits a job to what its backend takes)
         self.views = "auto"                       # "both" | "alternate" | "auto" | "stereo3d" (module docstring)
         self.s3d_curls = "geometric"              # stereo3d: curls from the joints ("geometric") or the keypoint model ("mercury")
         self.job_kind = None                      # "s3d" while a stereo3d job is in flight
@@ -153,7 +156,7 @@ class MercuryTracker:
         t_sub = time.monotonic()
         both = self.views == "both" or (self.views == "auto" and self.last_inference != "cpu")
         # second views take turns between hands: the hand that had both views longest ago goes first
-        spare = MAX_CROPS - len(sides) if both else 0
+        spare = self.max_crops - len(sides) if both else 0
         second = set(sorted(sides, key=lambda sd: self.hands[sd].last_both)[:max(0, spare)])
         for side in sides:
             hs = self.hands[side]

@@ -1,7 +1,8 @@
 """Pluggable Mercury inference over normalized crops; CPU remains the default.
 
 Backends implement infer(feeds) -> one output dict per feed, plus idle()/close().
-A call contains 1..3 available crops. There is no batching timer or crop queue.
+A call contains 1..max_crops available crops (3, or 4 on a 4-crop FrameNPU image). There is no
+batching timer or crop queue.
 """
 import logging
 
@@ -10,6 +11,12 @@ import numpy as np
 OUTPUTS = ("heatmap_xy", "heatmap_depth", "scalar_extras", "curls")
 SHAPES = ((1, 21, 22, 22), (1, 21, 22), (1, 8), (1, 10))
 LOG = logging.getLogger(__name__)
+
+
+def crops_per_call(backend):
+    """Crops one backend.infer call takes: its max_crops (3, or 4 on a 4-crop FrameNPU image)."""
+    m = getattr(backend, "max_crops", 3)
+    return m if isinstance(m, int) and not isinstance(m, bool) and 1 <= m <= 4 else 3
 
 
 class CPUBackend:
@@ -22,6 +29,8 @@ class CPUBackend:
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
+
+    max_crops = 4                 # one ONNX run per crop; any group size
 
     def infer(self, feeds):
         return [dict(zip(OUTPUTS, self.sess.run(list(OUTPUTS), f))) for f in feeds]
@@ -45,6 +54,10 @@ class FrameNPUBackend:
     def last_timing(self):
         return self.session.last_timing
 
+    @property
+    def max_crops(self):
+        return getattr(self.session, "max_crops", 3)
+
     def infer(self, feeds):
         return self.session.infer(feeds)
 
@@ -67,6 +80,10 @@ class ServiceBackend:
     @property
     def last_timing(self):
         return self.client.last_timing
+
+    @property
+    def max_crops(self):
+        return self.client.max_crops
 
     def infer(self, feeds):
         return self.client.infer(feeds)
@@ -99,6 +116,12 @@ class FallbackBackend:
     def last_timing(self):
         return getattr(self.accelerator, "last_timing", None)
 
+    @property
+    def max_crops(self):
+        """crops per infer call: the accelerator's (3, or 4 on a 4-crop FrameNPU image); after a
+        latch to the CPU, the CPU's"""
+        return crops_per_call(self.accelerator if self.accelerator is not None else self.cpu)
+
     def _disable(self, exc):
         backend, self.accelerator = self.accelerator, None
         LOG.warning("FrameNPU disabled for this worker; using CPU: %s", exc)
@@ -119,8 +142,8 @@ class FallbackBackend:
         return out
 
     def infer(self, feeds):
-        if not 1 <= len(feeds) <= 3:
-            raise ValueError("inference calls carry one to three crops")
+        if not 1 <= len(feeds) <= self.max_crops:
+            raise ValueError("inference calls carry one to %d crops" % self.max_crops)
         if self.accelerator is not None:
             try:
                 return self._check(self.accelerator.infer(feeds), len(feeds))
@@ -129,13 +152,13 @@ class FallbackBackend:
         return self.cpu.infer(feeds)
 
     def infer_frame(self, feeds, extra):
-        """Keypoint crops (1..3) and extra = (service model, crops) in one service frame request (one
+        """Keypoint crops (1..max_crops) and extra = (service model, crops) in one service frame request (one
         DSP job) -> (keypoint outputs, the extra request's outputs). The extra outputs are None
         when the accelerator cannot take them along (no service, a service without infer_frame or
         that model, or after a failure, which latches this worker to the CPU as infer does): the
         caller runs that request itself."""
-        if not 1 <= len(feeds) <= 3:
-            raise ValueError("inference calls carry one to three crops")
+        if not 1 <= len(feeds) <= self.max_crops:
+            raise ValueError("inference calls carry one to %d crops" % self.max_crops)
         client = getattr(self.accelerator, "client", None)
         if client is None or getattr(client, "max_frame", 0) < 2 or extra[0] not in client.models:
             return self.infer(feeds), None

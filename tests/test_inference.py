@@ -159,6 +159,12 @@ class CropBatchTests(unittest.TestCase):
         self.assertEqual(mk.run_many([{"value": i} for i in range(4)]), [0, 1, 2, 3])
         self.assertEqual([c.args[0] for c in mk.backend.infer.call_args_list], [[0, 1, 2], [3]])
 
+    def test_a_four_crop_backend_takes_four_in_one_call(self):
+        mk = self.wrapper()
+        mk.backend.max_crops = 4
+        self.assertEqual(mk.run_many([{"value": i} for i in range(5)]), [0, 1, 2, 3, 4])
+        self.assertEqual([c.args[0] for c in mk.backend.infer.call_args_list], [[0, 1, 2, 3], [4]])
+
     def test_blank_crop_keeps_its_slot_and_does_not_infer_or_pad(self):
         mk = self.wrapper()
         self.assertEqual(mk.run_many([{"value": i} for i in (1, None, 3)]), [1, None, 3])
@@ -402,6 +408,17 @@ class MercuryViewTests(unittest.TestCase):
             doubled.append([sd for sd in ("left", "right") if sum(j[1] == sd for j in jobs) == 2][0])
         self.assertEqual(len(set(doubled[0::2])), 1)
         self.assertNotEqual(doubled[0], doubled[1])
+
+    def test_four_crops_give_both_hands_both_views(self):
+        self.mt.views, self.mt.max_crops = "both", 4
+        self.mt.hands["right"] = self.HandState("right", self.J, 0.9)
+        self.mt.hands["left"] = self.HandState("left", self.J + [-0.3, 0, 0], 0.9)
+        for k in range(3):
+            self.mt.job = None
+            self.assertTrue(self.mt.submit({0: 0, 1: 0}, 10**9 + k, {}))
+            jobs = self.pool.submit.call_args.args[1]
+            self.assertEqual(sorted((j[1], j[0]) for j in jobs),
+                             [("left", 0), ("left", 1), ("right", 0), ("right", 1)])
 
     def test_cpu_inference_alternates_in_auto(self):
         self.mt.hands["right"] = self.HandState("right", self.J, 0.9)

@@ -68,8 +68,9 @@ S3D_INPUTS = (("inputImg", (1, 2, 128, 128)), ("lastKeypoints", (1, 84)), ("useL
 S3D_OUTPUTS = (("joints3d", (1, 63)), ("scalar_extras", (1, 8)))
 DET_INPUTS = (("inputImg", (1, 1, 160, 160)),)
 DET_OUTPUTS = (("hand_exists", (1, 2)), ("cx", (1, 2)), ("cy", (1, 2)), ("size", (1, 2)))
-SPECS = {0: (INPUTS, OUTPUTS, 3), 1: (S3D_INPUTS, S3D_OUTPUTS, 2),   # model -> (inputs, outputs, most crops)
+SPECS = {0: (INPUTS, OUTPUTS, 4), 1: (S3D_INPUTS, S3D_OUTPUTS, 2),   # model -> (inputs, outputs, most crops)
          2: (DET_INPUTS, DET_OUTPUTS, 2)}
+KP_CROPS = 3                  # keypoint crops per request unless the service reports more ("crops")
 MAX_FRAME = 2                 # requests per infer_frame (FrameNPU MULTI_SEGMENTS)
 MAX_SEQ = 4                   # requests per infer_many (two hands: ft7 3 + 1 crops, the 3D pairs)
 MAX_HEADER = 1 << 16
@@ -198,6 +199,14 @@ class Client:
         return resp, data
 
     @property
+    def max_crops(self):
+        """keypoint crops per request: 4 on a --max-crops 4 FrameNPU image, else 3"""
+        return min(int(self.info.get("crops", KP_CROPS)), SPECS[0][2])
+
+    def _most(self, model):
+        return self.max_crops if model == 0 else SPECS[model][2]
+
+    @property
     def max_seq(self):
         """requests per infer_many (0: the service predates it)"""
         return int(self.info.get("infer_many", 0))
@@ -223,7 +232,8 @@ class Client:
             raise ValueError("infer_many carries one to %d requests" % self.max_seq)
         reqs, payload, out_n = [], [], 0
         for model, feeds in requests:
-            ins, outs, most = SPECS[model]
+            ins, outs, _ = SPECS[model]
+            most = self._most(model)
             if not 1 <= len(feeds) <= most:
                 raise ValueError("inference calls carry one to %d crops" % most)
             if model not in self.models:
@@ -247,7 +257,8 @@ class Client:
         return res
 
     def infer(self, feeds, model=0):
-        ins, outs, most = SPECS[model]
+        ins, outs, _ = SPECS[model]
+        most = self._most(model)
         if not 1 <= len(feeds) <= most:
             raise ValueError("inference calls carry one to %d crops" % most)
         if model not in self.models:
@@ -271,10 +282,22 @@ class Client:
 
 
 # ---------------------------------------------------------------- server
+def _image_crops(jobs):
+    """keypoint crops per request of the FrameNPU image in jobs (link.json max_crops, else 3)"""
+    try:
+        n = json.load(open(os.path.join(jobs, "link.json"))).get("max_crops", KP_CROPS)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return KP_CROPS
+    return n if n in (KP_CROPS, SPECS[0][2]) else KP_CROPS
+
+
 class Server:
     def __init__(self, model, jobs, path, uid, session_factory=None, require_pin=True, s3d_model=None,
-                 det_model=None):
+                 det_model=None, crops=None):
         self.model, self.jobs, self.path, self.uid = model, jobs, path, uid
+        # keypoint crops per request: what the FrameNPU image's record says it runs (its
+        # MercurySession checks the image itself); tests pass crops
+        self.crops = crops if crops is not None else _image_crops(jobs)
         if s3d_model and det_model:
             raise ValueError("the 3D student and the detector do not fit one FrameNPU image together")
         extra = [(m, p) for m, p in ((1, s3d_model), (2, det_model)) if p]
@@ -328,11 +351,15 @@ class Server:
             except Exception as exc:          # poisoned sessions keep their refusal record
                 LOG.warning("session close (%s) retained device state: %s", why, exc)
 
+    def _check_crops(self, model, n):
+        if model == 0 and n > self.crops:
+            raise ValueError("infer carries one to %d crops" % self.crops)
+
     def _handle(self, header, payload):
         op = header.get("op")
         if op == "ping":
             return {"ok": True, "service": "mrhand-npu", "version": 4, "models": list(self.models),
-                    "infer_many": MAX_SEQ, "infer_frame": MAX_FRAME}, b""
+                    "infer_many": MAX_SEQ, "infer_frame": MAX_FRAME, "crops": self.crops}, b""
         if op == "idle":
             if self.session is not None:
                 self.session.idle()
@@ -341,6 +368,7 @@ class Server:
             n, model = _infer_count(header), _infer_model(header)
             if model not in self.models:
                 raise ValueError("model %d is not served" % model)
+            self._check_crops(model, n)
             ins, outspec, _ = SPECS[model]
             feeds = unpack_arrays(payload, n, ins)
             if self.session is None:
@@ -357,6 +385,7 @@ class Server:
             for model, n in seq:
                 if model not in self.models:
                     raise ValueError("model %d is not served" % model)
+                self._check_crops(model, n)
                 size = n * _nbytes(SPECS[model][0])
                 reqs.append((self.index[model], unpack_arrays(payload[at:at + size], n, SPECS[model][0])))
                 at += size

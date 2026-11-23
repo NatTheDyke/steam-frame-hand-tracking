@@ -143,6 +143,9 @@ def make_instructions(joints_m, flip, expand=EXPAND, twist=0.0):
 
 
 # ---------------------------------------------------------------- model wrapper
+from handtrack.inference import crops_per_call  # noqa: E402  (re-exported for mpworker)
+
+
 class MercuryKeypoint:
     def __init__(self, model_path, rig, slot_cams, det_size, raw_size=2464, threads=1,
                  backend=None, inference="cpu", framenpu_jobs=None, source=None, npu_socket=None, cell_offset=0.5):
@@ -225,14 +228,16 @@ class MercuryKeypoint:
                                    flip=flip, use_hint=use_hint, expand=expand)])[0]
 
     def run_many(self, observations):
-        """Available observations, in order; synchronous chunks of at most three.
+        """Available observations, in order; synchronous chunks of at most the backend's
+        max_crops (three, or four on a 4-crop FrameNPU image).
 
         Zero-contrast crops produce None in their original position and consume
         no inference slot. This method owns no queue and never pads a request.
         """
         results = []
-        for start in range(0, len(observations), 3):
-            prepared = [self._prepare(**o) for o in observations[start:start + 3]]
+        most = crops_per_call(self.backend)
+        for start in range(0, len(observations), most):
+            prepared = [self._prepare(**o) for o in observations[start:start + most]]
             valid = [p for p in prepared if p is not None]
             outputs = self.backend.infer([p[-1] for p in valid]) if valid else []
             if len(outputs) != len(valid):

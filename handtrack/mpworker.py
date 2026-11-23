@@ -311,8 +311,10 @@ def _finish_discovery(frames, items, outs, layout, det_size, tracked, t_start):
             preps += p
             owners.append((side, m))
     decs = []
-    for k in range(0, len(preps), 3):
-        group = preps[k:k + 3]
+    from handtrack.mercury_kp import crops_per_call
+    most = crops_per_call(mk.backend)
+    for k in range(0, len(preps), most):
+        group = preps[k:k + most]
         res = mk.backend.infer([g[-1] for g in group])
         decs += [mk._decode(g, r) for g, r in zip(group, res)]
     hands = {0: [], 1: []}
@@ -414,8 +416,10 @@ def run_mercury(jobs, imgs, raw=False, discover=None):
     mk = init_mercury()
     out = []
     finish = None
-    for start in range(0, len(jobs), 3):
-        group = jobs[start:start + 3]
+    from handtrack.mercury_kp import crops_per_call
+    most = crops_per_call(mk.backend)
+    for start in range(0, len(jobs), most):
+        group = jobs[start:start + most]
         observations = [dict(slot=j[0], det_img=imgs[j[0]], joints_cv=j[2],
                              flip=(j[1] == "right"), expand=j[3] if len(j) > 3 else None,
                              use_hint=j[4] if len(j) > 4 else True, raw=raw) for j in group]

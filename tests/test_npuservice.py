@@ -115,6 +115,35 @@ class ServiceTests(unittest.TestCase):
                 return
             time.sleep(0.01)
 
+    def test_a_three_crop_image_refuses_four_and_says_so(self):
+        c = ns.Client(self.path)
+        self.assertEqual(c.max_crops, 3)
+        with self.assertRaises(ValueError):                    # the client knows the limit
+            c.infer([feed(1)] * 4)
+        c.info = dict(c.info, crops=4)                         # a client that believes otherwise
+        with self.assertRaises(RuntimeError):                  # the service refuses
+            c.infer([feed(1)] * 4)
+        c.close()
+
+    def test_a_four_crop_image_serves_four_in_order(self):
+        self.srv.crops = 4
+        c = ns.Client(self.path)
+        self.assertEqual(c.max_crops, 4)
+        outs = c.infer([feed(i + 1) for i in range(4)])
+        for i, o in enumerate(outs):
+            for name, shape in ns.OUTPUTS:
+                self.assertTrue(np.all(o[name] == (i + 1) * 128 * 128 + 1))
+        c.close()
+
+    def test_image_crops_come_from_the_record(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ns._image_crops(d), 3)            # no record
+            for rec, want in (({"max_crops": 4}, 4), ({}, 3), ({"max_crops": 9}, 3)):
+                with open(os.path.join(d, "link.json"), "w") as f:
+                    json.dump(rec, f)
+                self.assertEqual(ns._image_crops(d), want)
+
     def test_round_trip_one_to_three_crops_in_order(self):
         c = ns.Client(self.path)
         for k in (1, 2, 3):
@@ -175,7 +204,7 @@ class ServiceTests(unittest.TestCase):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(2)
         s.connect(self.path)
-        ns.send_msg(s, {"op": "infer", "n": 4})               # more than three crops: dropped
+        ns.send_msg(s, {"op": "infer", "n": 5})               # more than four crops: dropped
         self.assertEqual(s.recv(16), b"")
         s.close()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -334,7 +363,7 @@ class InferManyTests(Stereo3DServiceTests):
         c.close()
 
     def test_malformed_infer_many_is_dropped(self):
-        for reqs in ([], [{"model": 0, "n": 4}], [{"model": 1, "n": 3}], [{"model": 7, "n": 1}], "x",
+        for reqs in ([], [{"model": 0, "n": 5}], [{"model": 1, "n": 3}], [{"model": 7, "n": 1}], "x",
                      [{"model": 0, "n": 1}] * (ns.MAX_SEQ + 1)):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(2)

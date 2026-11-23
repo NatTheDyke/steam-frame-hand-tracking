@@ -367,8 +367,11 @@ def main():
                          "(views from different times describe different hand poses when the hand moves)")
     ap.add_argument("--merc-views", choices=("auto", "both", "alternate", "stereo3d"), default="auto",
                     help="Mercury views per hand and frame: both cameras of the same frame (stereo from one "
-                         "instant, at most 3 crops per job) or alternate cameras (stereo against the other "
+                         "instant, at most --merc-crops crops per job) or alternate cameras (stereo against the other "
                          "camera's previous frame); auto = both when inference runs on the NPU")
+    ap.add_argument("--merc-crops", type=int, choices=(3, 4), default=3,
+                    help="crops per Mercury job: 4 = both hands in both views (needs the 4-crop FrameNPU "
+                         "image; the worker splits a job to what its backend takes, so 4 never fails)")
     ap.add_argument("--merc-s3d-model", type=os.path.expanduser,
                     help="3D stereo student ONNX (distill make_stereo3d graph) for --merc-views stereo3d: both cameras' crops of each hand from the same pair, one 3D inference (CPU) plus the keypoint model on both crops")
     ap.add_argument("--merc-s3d-curls", choices=("geometric", "mercury"), default="geometric",
@@ -530,6 +533,7 @@ def main():
         mt.predict_roi = a.merc_predict_roi
         mt.stereo_ms = a.merc_stereo_ms
         mt.views = a.merc_views
+        mt.max_crops = a.merc_crops
         mt.s3d_curls = a.merc_s3d_curls
         mt.stereo_comp = a.merc_stereo_comp == "on"
         mt.curl_latest = a.curl_latest
