@@ -396,6 +396,11 @@ def main():
                          "camera and with the current position (prevents short depth jumps)")
     ap.add_argument("--merc-early", action="store_true",
                     help="collect finished Mercury jobs and submit the next one between camera frames")
+    ap.add_argument("--merc-preflow", action="store_true",
+                    help="collect a finished Mercury job and submit the next one as soon as a camera pair is read, "
+                         "before its detector images and optical flow (~8 ms sooner); crops are placed with the "
+                         "previous frame's flow positions, and the job gets this frame's images and depth anchor "
+                         "when flow is done (raw-frame crops only)")
     ap.add_argument("--merc-fresh", action="store_true",
                     help="submit Mercury right after optical flow (before MediaPipe handling); collect finished jobs "
                          "between camera frames and submit then only if the newest frame became ready less than a "
@@ -653,6 +658,7 @@ def main():
         frame_no = 0
         last_hand = 0.0
         adm = Admission(fresh=a.merc_fresh)  # capture admission + held-power release (handtrack/mercsched.py)
+        preflow = a.merc_preflow and mt is not None   # --merc-preflow: submit before detector images + flow
         frame_t = {}                         # stage times of the newest processed pair (monotonic ns)
         blocked = ["untracked"]              # why merc_admit last refused to submit (logged with a release)
         def merc_service(between_frames=False, path=None):
@@ -733,7 +739,13 @@ def main():
                     if tel is not None:
                         tel.write("C,%d,%s" % (t_cap, mt.collapsed))
 
-        def merc_admit(between_frames, path=None):
+        def anchors(fp):
+            """v2: Mercury anchors single-view depth only to a two-camera position, never to a held
+            single-camera depth (that error would otherwise propagate into the joints)"""
+            return {sd: v for sd, v in fp.items()
+                    if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
+
+        def merc_admit(between_frames, path=None, pending=False):
             """Submit the next job on the newest processed frame (imgs / t_cap / fast_pos) if admitted.
             Blocked admission (no tracked hand, stalled cameras, thermal pause, no placeable crop) is
             not marked active, so merc_power() releases held power after the grace period."""
@@ -762,13 +774,12 @@ def main():
             if not adm.admissible(now, grid.period / 1e9, between_frames):
                 adm.active(now)                     # this capture was used (or is stale): next frame
                 return
-            # v2: Mercury anchors single-view depth only to a two-camera position, never to a held
-            # single-camera depth (that error would otherwise propagate into the joints); the crop is
-            # still placed with every fast position (its image location is right)
-            fp_ = {sd: v for sd, v in fast_pos.items()
-                   if not a.flow_v2 or fast.info.get(sd, {}).get("src") == "stereo"}
+            # the crop is placed with every fast position (its image location is right); the depth anchor
+            # only with two-camera ones (anchors).  pending (--merc-preflow): this capture's detector images
+            # and flow do not exist yet -- placed with the previous frame's positions, completed after flow
+            fp_ = anchors(fast_pos)
             info = dict(frame_t, path=path or ("early" if between_frames else "frame"), seq=adm.seq)
-            if mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_, info=info, raw_imgs=raw_frames):
+            if mt.submit(None if pending else imgs, t_cap, fast_pos, anchor_pos=fp_, info=info, raw_imgs=raw_frames):
                 adm.submitted(now)
                 next_merc = now + iv
                 last_sub_cap[0] = t_cap
@@ -850,6 +861,10 @@ def main():
             frame_t = {"t_read": time.monotonic_ns()}
             frame_no += 1
             have_frame = True
+            if preflow:
+                # a finished job lands on the previous processed frame (its images, flow and time), as a
+                # between-frames collect does, so the next one can be submitted on this capture right away
+                merc_collect()
             t_raw = min(r0[1], r1[1])
             adopted = grid.adopted
             t_cap = grid.update(t_raw)
@@ -860,6 +875,13 @@ def main():
             imgs = {0: src.det_image(r0[2], 0, a.size), 1: src.det_image(r1[2], 1, a.size)}
             raw_frames = {0: r0[2], 1: r1[2]} if merc_raw else None
             pub_frames = {0: r0[2], 1: r1[2]}
+            preflow_sub = False
+            if preflow and merc_raw and mt.views != "stereo3d":
+                adm.frame(frame_no, frame_t["t_read"] / 1e9)
+                before_ = adm.submitted_seq
+                merc_admit(False, path="preflow", pending=True)
+                merc_power()
+                preflow_sub = adm.submitted_seq != before_
 
             # ---- fast path: position every camera frame (every other frame when hot)
             tf = time.perf_counter()
@@ -869,6 +891,8 @@ def main():
             fast_ms = (time.perf_counter() - tf) * 1e3
             frame_t["t_ready"] = time.monotonic_ns()
             adm.frame(frame_no, frame_t["t_ready"] / 1e9)
+            if preflow_sub:
+                mt.complete(imgs, anchors(fast_pos), frame_t["t_ready"])
             if a.merc_fresh:
                 # submit on this frame as soon as its flow positions exist, before MediaPipe handling
                 merc_service()

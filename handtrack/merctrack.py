@@ -199,7 +199,7 @@ class MercuryTracker:
         disc, self.job_disc = self.discover_req, None
         if disc is not None and raw_imgs is not None:
             self.discover_req = None
-            disc.update(t_cap=t_cap_ns, det_imgs=dict(imgs))
+            disc.update(t_cap=t_cap_ns, det_imgs=dict(imgs) if imgs is not None else None)
             req = {k: disc[k] for k in ("pick", "ncrop", "det_size")}
             req["tracked"] = {sd: self.palm_c(hs.P) for sd, hs in self.hands.items()}
             ref = self.ring.put(raw_imgs) if self.ring is not None else None
@@ -217,17 +217,35 @@ class MercuryTracker:
         else:
             fut = self.pool.submit(self.worker.run_mercury, jobs, {s: imgs[s] for s in used})
         self.job = (fut, t_cap_ns, fast_pos,
-                    {s: imgs[s] for s in used}, time.monotonic_ns(), len(jobs))
+                    {s: imgs[s] for s in used} if imgs is not None else None, time.monotonic_ns(), len(jobs))
         if anchor_pos is not None:
             self.job = self.job[:2] + (anchor_pos,) + self.job[3:]
+        self.job_used = used
         self.job_info = dict(info or {})
         self.last_submit_t = t_sub
+        return True
+
+    def pending(self):
+        """A job submitted with imgs=None (live.py --merc-preflow, before its capture's detector images and
+        flow positions existed) that complete() has not filled in yet."""
+        return self.job is not None and self.job_kind != "s3d" and self.job[3] is None
+
+    def complete(self, imgs, anchor_pos, t_ready=None):
+        """--merc-preflow: the submitted capture's detector images and flow-position depth anchor, now that
+        they exist; collect() waits for this, so the job is applied exactly as one submitted after flow."""
+        if not self.pending():
+            return False
+        self.job = self.job[:2] + (anchor_pos,) + ({s: imgs[s] for s in self.job_used},) + self.job[4:]
+        if self.job_disc is not None and self.job_disc.get("det_imgs") is None:
+            self.job_disc["det_imgs"] = dict(imgs)
+        if t_ready is not None:
+            self.job_info["t_ready"] = t_ready
         return True
 
     def collect(self):
         """If the in-flight job finished: update hand states.
         Returns {side: (pose tuple, slot, det_px, t_capture_s, image_the_crop_came_from)}."""
-        if self.job is None or not self.job[0].done():
+        if self.job is None or not self.job[0].done() or self.pending():
             return {}
         if self.job_kind == "s3d":
             return self._collect_s3d()

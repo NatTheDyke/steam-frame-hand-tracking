@@ -283,6 +283,41 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(tracker.submit({0: np.zeros(1), 1: np.zeros(1)}, 2 * 10**9, {}))
         self.assertIsNotNone(tracker.last_submit_t)
 
+    def test_preflow_job_waits_for_its_images_and_anchor(self):
+        """--merc-preflow: submitted before the capture's detector images / flow exist; collect() holds the
+        finished job until complete() fills them in, then applies it with this capture's anchor."""
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+        from handtrack.merctrack import MercuryTracker, HandState
+
+        pool, done = Mock(), Future()
+        pool.submit.return_value = done
+        palm = SimpleNamespace(pose={0: (np.eye(3), np.zeros(3)), 1: (np.eye(3), np.zeros(3))})
+        tracker = MercuryTracker(palm, pool, Mock())
+        joints = np.random.default_rng(6).normal(0, .01, (21, 3)) + [0, 0, .5]
+        tracker.hands["left"] = HandState("left", joints, 1.0)
+        want = Future()
+        tracker.discover_req = dict(future=want, pick=0, ncrop=2, det_size=640, t_req=0.0)
+        raw = {0: "r0", 1: "r1"}
+        old = {"left": (np.array([0.0, 0, .5]), None)}
+        self.assertTrue(tracker.submit(None, 10**9, old, anchor_pos=old, info={"t_read": 5}, raw_imgs=raw))
+        self.assertTrue(tracker.pending())
+        self.assertEqual(pool.submit.call_args.args[2], raw)
+        self.assertIsNone(tracker.job_disc["det_imgs"])
+        done.set_result({"obs": [(1, "left", None, 0.01, {})], "discover": {0: ([], .01), 1: ([], .01)}})
+        self.assertEqual(tracker.collect(), {})                   # finished, but not completed yet
+        self.assertFalse(want.done())
+        imgs, new = {0: "d0", 1: "d1"}, {"left": (np.array([0.01, 0, .5]), None)}
+        self.assertTrue(tracker.complete(imgs, new, t_ready=7))
+        self.assertFalse(tracker.pending())
+        self.assertIs(tracker.job[2], new)
+        self.assertEqual(tracker.job[3], {s: imgs[s] for s in tracker.job_used})
+        self.assertEqual(tracker.job_disc["det_imgs"], imgs)
+        tracker.collect()
+        self.assertEqual(want.result(0), {0: ([], .01), 1: ([], .01)})
+        self.assertEqual((tracker.records[0]["t_read"], tracker.records[0]["t_ready"]), (5, 7))
+        self.assertFalse(tracker.complete(imgs, new))              # nothing pending
+
     def test_records_carry_submit_path_sequence_and_stage_times(self):
         from concurrent.futures import Future
         from types import SimpleNamespace
