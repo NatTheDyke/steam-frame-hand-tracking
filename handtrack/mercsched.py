@@ -92,6 +92,25 @@ class FrameGrid:
         return int(self.t)
 
 
+def capture_cap_frames(interval_s, period_s):
+    """Camera frames between submissions for a cap interval: the nearest whole number (at least 1)."""
+    return max(1, int(round(interval_s / period_s)))
+
+
+def capture_cap_due(t_cap_ns, last_cap_ns, interval_s, period_ns):
+    """--merc-cadence capture: the rate cap counted in camera frames instead of wall time.
+
+    A wall-clock cap of 33.3 ms over 8.74 ms (120 Hz) captures submits after 3, 4 or 5 frames as
+    loop timing jitters; each 5-frame gap (43.7 ms) leaves the other camera's view older than
+    merctrack.STEREO_MS, so that crop cannot be triangulated.  Counting frames gives a fixed
+    capture_cap_frames gap (4 frames, 35 ms, at 120 Hz; every frame at 30 Hz).  Half a frame of
+    slack absorbs capture-time jitter; a frame the loop skipped is replaced by the next one."""
+    if last_cap_ns is None:
+        return True
+    k = capture_cap_frames(interval_s, period_ns / 1e9)
+    return t_cap_ns - last_cap_ns >= (k - 0.5) * period_ns
+
+
 def rate_cap_due(now, next_t, period_s):
     """The Mercury rate cap (--merc-hz) allows a new submission at next_t (previous submission + the
     cap interval).  Camera frames arrive one period apart with ~1 ms jitter, so with the cap equal to

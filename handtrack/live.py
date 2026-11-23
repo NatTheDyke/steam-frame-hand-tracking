@@ -52,7 +52,7 @@ from handtrack import source as camsource
 from handtrack.calib import triangulate
 from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
-from handtrack.mercsched import Admission, FrameGrid, rate_cap_due
+from handtrack.mercsched import Admission, FrameGrid, capture_cap_due, rate_cap_due
 from handtrack.palm import PALM_IDX, Bridge, OneEuro, PalmTracker
 
 SHM = "/dev/shm/mrhand-pt"
@@ -324,6 +324,9 @@ class Viewer:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", type=int, default=640, help="detector input size (square)")
+    ap.add_argument("--det-resample", choices=("area", "linear", "remap"), default="area",
+                    help="how a camera frame is scaled to the detector image (source.Source.resample): "
+                         "area (default), linear (~2.5x faster), remap (one pass, ~4x faster, aliased)")
     ap.add_argument("--source", choices=sorted(camsource.SOURCES), default=os.environ.get(camsource.ENV, "passthrough"),
                     help="camera source: passthrough (ptgrab, room view only) or slam (slamgrab, tracking "
                          "cameras, works in games); default passthrough or $HANDTRACK_SOURCE")
@@ -400,6 +403,10 @@ def main():
     ap.add_argument("--uclamp-max", type=int, default=os.environ.get("HANDTRACK_UCLAMP_MAX") or None,
                     help="cap the CPU frequency this tracker and its workers request (Linux uclamp, 0..1024; "
                          "512 ~ 2 GHz on the big cores); default: no cap (or HANDTRACK_UCLAMP_MAX)")
+    ap.add_argument("--merc-cadence", choices=("wall", "capture"), default="wall",
+                    help="count the --merc-hz cap in wall time (default) or in camera frames (capture: "
+                         "a fixed frame gap, e.g. every 4th frame at 120 Hz, so alternate views stay "
+                         "within merctrack.STEREO_MS; mercsched.capture_cap_due)")
     ap.add_argument("--merc-sched", choices=("batch", "perhand"), default="batch",
                     help="batch: all tracked hands in one Mercury job, published together (original); "
                          "perhand: one hand per job on the newest frame, published as soon as it is done")
@@ -468,6 +475,7 @@ def main():
     # the source must be set in the environment before any worker process is spawned
     os.environ[camsource.ENV] = a.source
     src = camsource.active()
+    src.resample = a.det_resample
     shm = PtShm(src.shm)
     print("camera source: %s (%s, %dx%d published, %.0f Hz)" % (src.name, src.shm, shm.w, shm.h, 1e9 / src.period_ns),
           file=sys.stderr, flush=True)
@@ -630,6 +638,7 @@ def main():
         job = None           # (future, kind, slot, imgs_at_detection, t_cap)
         shadow = None        # Mercury shadow comparison in flight
         next_merc = 0.0
+        last_sub_cap = [None]                # capture time (ns) of the newest submission (--merc-cadence capture)
         next_det = 0.0
         det_pick = 0         # --discover mercury ride-along: the next crop position
         k = 0
@@ -730,7 +739,7 @@ def main():
             if not mt.tracked() or adm.stalled(now):
                 blocked[0] = "untracked" if not mt.tracked() else "stall"
                 return
-            if not rate_cap_due(now, next_merc, grid.period / 1e9):
+            if a.merc_cadence == "wall" and not rate_cap_due(now, next_merc, grid.period / 1e9):
                 adm.active(now)                     # rate cap: still tracking
                 return
             # perhand: one crop per job, so the same per-hand rate cap allows n jobs per period
@@ -738,6 +747,9 @@ def main():
             iv = thermal.interval(a.merc_hz * n_)
             if iv is None:
                 blocked[0] = "thermal"
+                return
+            if a.merc_cadence == "capture" and not capture_cap_due(t_cap, last_sub_cap[0], iv, grid.period):
+                adm.active(now)                     # rate cap (in camera frames): still tracking
                 return
             if not adm.admissible(now, grid.period / 1e9, between_frames):
                 adm.active(now)                     # this capture was used (or is stale): next frame
@@ -751,6 +763,7 @@ def main():
             if mt.submit(imgs, t_cap, fast_pos, anchor_pos=fp_, info=info, raw_imgs=raw_frames):
                 adm.submitted(now)
                 next_merc = now + iv
+                last_sub_cap[0] = t_cap
             else:
                 blocked[0] = "unplaceable"          # no crop in front of either camera
                 # no job will come back to drop a hand that stays unplaceable: drop it once it is lost

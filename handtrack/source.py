@@ -12,7 +12,12 @@ shm slot 0 is always the right camera, slot 1 the left.
 
 Detector image (det_size S square):  raw calibrated pixels -> crop to the square (x0, y0, n) ->
 scale to S -> rotate about the image centre by the slot's angle (degrees, clockwise on screen) so
-that head "down" points down in the image.  Passthrough uses exact quarter turns (90 = CW, -90 =
+that head "down" points down in the image.
+
+Source.resample picks how a frame that needs scaling is scaled (a frame at S already is only rotated,
+bit-identically in every mode):  "area" (the default) area-averages then rotates; "linear" scales
+bilinearly then rotates (~2.5x faster at 1024 -> 640, mean 0.9 grey levels off "area"); "remap"
+scales and rotates in one bilinear pass from a precomputed map (~4x faster, 2.9 levels off: aliased).  Passthrough uses exact quarter turns (90 = CW, -90 =
 CCW: the original behaviour); the SLAM cameras are also rolled ~35 deg, so their angle comes from
 the factory calibration (upright_angle).
 """
@@ -39,6 +44,8 @@ class Source:
         self.period_ns = period_ns
         self._angles = dict(angles) if angles else None
         self._from_calib = upright_from_calib
+        self.resample = "area"
+        self._maps = {}
 
     # ---------------------------------------------------------------- rotation
     def angle(self, slot):
@@ -85,8 +92,14 @@ class Source:
         f = img.shape[1] / self.raw_w                 # published pixels per raw pixel
         x0, y0, n = (int(round(v * f)) for v in (self.x0, self.y0, self.n))
         sq = img[y0:y0 + n, x0:x0 + n]
-        if sq.shape[0] != S or sq.shape[1] != S:
-            sq = cv2.resize(sq, (S, S), interpolation=cv2.INTER_AREA)
+        scale = sq.shape[0] != S or sq.shape[1] != S
+        if scale and self.resample == "remap":
+            return cv2.remap(img, *self._map(img.shape, slot, S, x0, y0, n), cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if scale:
+            if self.resample not in ("area", "linear"):
+                raise ValueError("resample %r: expected area, linear or remap" % (self.resample,))
+            sq = cv2.resize(sq, (S, S), interpolation=cv2.INTER_AREA if self.resample == "area" else cv2.INTER_LINEAR)
         a = self.angle(slot)
         if a % 360 == 0:
             return np.ascontiguousarray(sq)
@@ -97,6 +110,25 @@ class Source:
         M = self._rot(slot)
         A = np.hstack([M, (np.array([c, c]) - M @ np.array([c, c]))[:, None]])
         return cv2.warpAffine(sq, A, (S, S), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    def _map(self, shape, slot, S, x0, y0, n):
+        """remap tables taking each S x S detector pixel to its published-frame pixel, outside the
+        crop square sampling the border (0) as the two-pass path does."""
+        key = (shape, slot, S)
+        if key not in self._maps:
+            c = (S - 1) / 2.0
+            M = self._rot(slot)
+            yy, xx = np.mgrid[0:S, 0:S].astype(float)
+            u, v = xx - c, yy - c                      # rotation inverse = M^T
+            sx = M[0, 0] * u + M[1, 0] * v + c
+            sy = M[0, 1] * u + M[1, 1] * v + c
+            k = n / S
+            px, py = (sx + 0.5) * k - 0.5, (sy + 0.5) * k - 0.5
+            out = (px < -0.5) | (px > n - 0.5) | (py < -0.5) | (py > n - 0.5)
+            mx = np.where(out, -10.0, px + x0).astype(np.float32)
+            my = np.where(out, -10.0, py + y0).astype(np.float32)
+            self._maps[key] = cv2.convertMaps(mx, my, cv2.CV_16SC2)
+        return self._maps[key]
 
 
 SOURCES = {

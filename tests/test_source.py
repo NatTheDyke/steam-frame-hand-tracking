@@ -65,6 +65,58 @@ class SlamGeometry(unittest.TestCase):
                 want = SLAM.raw_to_det(np.array([p]), slot, S)[0]
                 self.assertLess(np.linalg.norm(found - want), 1.0, (slot, p, found, want))
 
+    def _modes(self):
+        for mode in ("area", "linear", "remap"):
+            SLAM.resample = mode
+            try:
+                yield mode
+            finally:
+                SLAM.resample = "area"
+
+    def test_resample_modes_follow_mapping(self):
+        """Every resample mode puts a raw spot where raw_to_det says."""
+        for mode in self._modes():
+            for slot in (0, 1):
+                for p in ((300.0, 200.0), (700.0, 650.0), (528.0, 512.0)):
+                    img = np.zeros((1024, 1056), np.uint8)
+                    cv2.circle(img, (int(p[0]), int(p[1])), 12, 255, -1)
+                    det = SLAM.det_image(img, slot, S).astype(float)
+                    ys, xs = np.nonzero(det > 40)
+                    w = det[ys, xs]
+                    found = np.array([(xs * w).sum() / w.sum(), (ys * w).sum() / w.sum()])
+                    want = SLAM.raw_to_det(np.array([p]), slot, S)[0]
+                    self.assertLess(np.linalg.norm(found - want), 1.0, (mode, slot, p, found, want))
+
+    def test_resample_modes_agree_on_smooth_images(self):
+        rng = np.random.default_rng(5)
+        img = cv2.GaussianBlur(rng.integers(0, 255, (1024, 1056)).astype(np.uint8), (0, 0), 6)
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+        ref = {slot: SLAM.det_image(img, slot, S).astype(float) for slot in (0, 1)}
+        for mode in self._modes():
+            for slot in (0, 1):
+                got = SLAM.det_image(img, slot, S).astype(np.float32)[60:-60, 60:-60]
+                want = ref[slot].astype(np.float32)[60:-60, 60:-60]
+                # remap interpolates once (sharper than area + rotate), never shifted
+                self.assertLess(np.abs(got - want).mean(), 2.5 if mode == "remap" else 1.0, (mode, slot))
+                self.assertLess(np.abs(cv2.phaseCorrelate(want, got)[0]).max(), 0.05, (mode, slot))
+                # corners rotated out of the crop square stay black in every mode
+                self.assertEqual(SLAM.det_image(np.full((1024, 1056), 200, np.uint8), slot, S)[0, 0], 0)
+
+    def test_unscaled_frames_are_identical_in_every_mode(self):
+        img = np.random.default_rng(6).integers(0, 255, (1024, 1056), np.uint8)
+        ref = {slot: SLAM.det_image(img, slot, 1024) for slot in (0, 1)}
+        for mode in self._modes():
+            for slot in (0, 1):
+                np.testing.assert_array_equal(SLAM.det_image(img, slot, 1024), ref[slot])
+
+    def test_unknown_resample_mode(self):
+        SLAM.resample = "cubic"
+        try:
+            with self.assertRaises(ValueError):
+                SLAM.det_image(np.zeros((1024, 1056), np.uint8), 0, S)
+        finally:
+            SLAM.resample = "area"
+
     def test_det_image_is_square(self):
         img = np.zeros((1024, 1056), np.uint8)
         for slot in (0, 1):

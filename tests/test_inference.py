@@ -428,6 +428,26 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(rate_cap_due(submit + 1 / 60.0, next_t, 1 / 60.0))
         self.assertTrue(rate_cap_due(submit + 2 / 60.0 - 0.001, next_t, 1 / 60.0))
 
+    def test_capture_cadence_keeps_a_fixed_frame_gap(self):
+        from handtrack.mercsched import capture_cap_due, capture_cap_frames
+        iv = 1 / 30.0
+        for hz, k in ((114.4, 4), (30.0, 1), (60.0, 2), (90.0, 3)):
+            period_ns = 1e9 / hz
+            self.assertEqual(capture_cap_frames(iv, period_ns / 1e9), k)
+            rng = np.random.default_rng(int(hz))
+            last, subs = None, []
+            for i in range(400):
+                t = int(i * period_ns + rng.normal(0, 0.3e6))   # capture-time jitter 0.3 ms
+                if capture_cap_due(t, last, iv, period_ns):
+                    subs.append(i)
+                    last = t
+            self.assertEqual(set(np.diff(subs)), {k}, hz)
+        # a frame the loop never processed: the next processed one is taken
+        p = 1e9 / 114.4
+        self.assertFalse(capture_cap_due(int(3 * p), 0, iv, p))
+        self.assertTrue(capture_cap_due(int(5 * p), 0, iv, p))
+        self.assertTrue(capture_cap_due(0, None, iv, p))
+
     def test_a_capture_is_submitted_at_most_once(self):
         from handtrack.mercsched import Admission
         adm = Admission()
