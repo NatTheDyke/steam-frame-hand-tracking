@@ -19,7 +19,7 @@ def outputs(value=0):
 class BackendTests(unittest.TestCase):
     def test_init_failure_keeps_cpu_and_does_not_retry(self):
         cpu, factory = Mock(), Mock(side_effect=PermissionError("no device access"))
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             backend = FallbackBackend(cpu, factory)
         backend.infer([1])
         backend.infer([2, 3])
@@ -34,7 +34,7 @@ class BackendTests(unittest.TestCase):
         accelerator.close.side_effect = RuntimeError("state retained")
         backend = FallbackBackend(cpu, lambda: accelerator)
         feeds = [object(), object(), object()]
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             backend.infer(feeds)
         self.assertIs(cpu.infer.call_args.args[0], feeds)
         backend.infer([object()])
@@ -51,7 +51,7 @@ class BackendTests(unittest.TestCase):
                 cpu, accelerator = Mock(), Mock()
                 accelerator.infer.return_value = result
                 backend = FallbackBackend(cpu, lambda: accelerator)
-                with self.assertLogs("handtrack.inference", "WARNING"):
+                with self.assertLogs("framenpu.backends", "WARNING"):
                     backend.infer([object()])
                 cpu.infer.assert_called_once()
                 self.assertEqual(backend.name, "cpu")
@@ -74,7 +74,7 @@ class BackendTests(unittest.TestCase):
         cpu, accelerator = Mock(), Mock()
         accelerator.idle.side_effect = RuntimeError("power verification failed")
         backend = FallbackBackend(cpu, lambda: accelerator)
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             backend.idle()
         backend.infer([object()])
         accelerator.close.assert_called_once()
@@ -87,7 +87,7 @@ class BackendTests(unittest.TestCase):
         backend = FallbackBackend(cpu, lambda: accelerator)
         self.assertEqual(backend.last_timing, accelerator.last_timing)
         accelerator.idle.side_effect = RuntimeError("cannot verify power")
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             backend.idle()
         self.assertIsNone(backend.last_timing)
 
@@ -123,7 +123,7 @@ class FrameRequestTests(unittest.TestCase):
         client = Mock(max_frame=2, models=[0, 2])
         client.infer_frame.side_effect = RuntimeError("completion uncertain")
         backend, _ = self.backend(client)
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             kp, ex = backend.infer_frame(["a"], (2, ["d"]))
         self.assertIsNone(ex)
         self.assertEqual(backend.cpu.infer.call_args.args[0], ["a"])
@@ -132,7 +132,7 @@ class FrameRequestTests(unittest.TestCase):
         client.infer_frame.return_value = [[outputs()], ["d"], ["x"]]
         backend2, _ = self.backend(client)
         client.infer_frame.return_value = [[outputs()], []]               # wrong extra count
-        with self.assertLogs("handtrack.inference", "WARNING"):
+        with self.assertLogs("framenpu.backends", "WARNING"):
             self.assertIsNone(backend2.infer_frame(["a"], (2, ["d"]))[1])
 
 
