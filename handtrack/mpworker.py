@@ -42,17 +42,49 @@ _merc_config = {}
 _merc_model = "~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"
 
 
+def _open_session(inference="cpu", framenpu_jobs=None, npu_socket=None):
+    """One framenpu session (framenpu.open) for every model this worker runs: the keypoint model,
+    the detector (when its file is here) and the 3D stereo student (when configured). On the NPU
+    service each runs there when the service serves it, else on the CPU (loaded on first use)."""
+    import framenpu
+    from handtrack.mercury_kp import INFERENCE
+    models = [(os.path.expanduser(_merc_model), "mercury-ft7")]
+    names = {"keypoint": 0}
+    det = os.path.expanduser(_det_model) if _det_model else None
+    if det and os.path.exists(det):
+        names["detector"] = len(models)
+        models.append((det, "mercury-detector-160"))
+    if _s3d_model:
+        names["stereo3d"] = len(models)
+        models.append((os.path.expanduser(_s3d_model), "mercury-stereo3d-tpc1"))
+    s = framenpu.open(models, INFERENCE[inference], jobs=framenpu_jobs, socket=npu_socket)
+    return s, {k: s.models[i] for k, i in names.items()}
+
+
+_names = {}               # kind -> the session's model name (keypoint, detector, stereo3d)
+
+
 def init_mercury():
     """Lazily load Monado Mercury's keypoint model (license UNVERIFIED: local measurement only)."""
-    global _merc
+    global _merc, _names
     if _merc is None:
         from handtrack import source as camsource
         from handtrack.calib import Rig
         from handtrack.mercury_kp import MercuryKeypoint
         src = camsource.active()          # HANDTRACK_SOURCE, inherited from live.py
-        _merc = MercuryKeypoint(os.path.expanduser(_merc_model),
-                                Rig(), src.slot_cams, 640, source=src, **_merc_config)
+        cfg = dict(_merc_config)
+        session, _names = _open_session(cfg.pop("inference", "cpu"), cfg.pop("framenpu_jobs", None),
+                                        cfg.pop("npu_socket", None))
+        _merc = MercuryKeypoint(os.path.expanduser(_merc_model), Rig(), src.slot_cams, 640, source=src,
+                                session=session, model=_names["keypoint"], **cfg)
     return _merc
+
+
+def _session_model(mk, kind):
+    """(session, model name) of `kind` in the keypoint model's session, or (None, None)"""
+    s = getattr(mk, "session", None)
+    name = _names.get(kind)
+    return (s, name) if s is not None and name in getattr(s, "models", ()) else (None, None)
 
 
 def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, model=None, s3d_model=None,
@@ -85,12 +117,6 @@ _s3d_model = None
 _s3d_geo = None
 
 
-def _service_client(backend):
-    """the NPU service client behind the keypoint backend (FallbackBackend -> ServiceBackend), if any"""
-    acc = getattr(backend, "accelerator", backend)
-    return getattr(acc, "client", None)
-
-
 def init_stereo3d():
     """the 3D stereo student (views = stereo3d) and the camera-to-camera transform, lazily"""
     global _s3d, _s3d_geo
@@ -100,10 +126,9 @@ def init_stereo3d():
         from handtrack import stereo3d
         from handtrack.calib import Rig
         from handtrack import source as camsource
-        path = os.path.expanduser(_s3d_model)
-        cpu = lambda: stereo3d.Stereo3D(path)  # noqa: E731
-        client = _service_client(init_mercury().backend)
-        _s3d = stereo3d.ServiceStereo3D(client, cpu) if client is not None and 1 in client.models else cpu()
+        session, name = _session_model(init_mercury(), "stereo3d")
+        _s3d = (stereo3d.SessionStereo3D(session, name) if session is not None
+                else stereo3d.Stereo3D(os.path.expanduser(_s3d_model)))
         rig, src = Rig(), camsource.active()
         slot_of = {n: s for s, n in src.slot_cams.items()}
         v = [slot_of[n] for n in stereo3d.VIEW_CAMS]
@@ -112,20 +137,20 @@ def init_stereo3d():
     return _s3d, _s3d_geo
 
 
-def _many_client(mk, s3d):
-    """the NPU service client when both models go through it and it takes infer_many"""
-    acc = getattr(mk.backend, "accelerator", None)
-    client = getattr(acc, "client", None)
-    if client is None or getattr(s3d, "client", None) is not client:
+def _many_session(mk, s3d):
+    """the session when the keypoint model and the 3D student both run on its accelerator"""
+    session, name = _session_model(mk, "stereo3d")
+    if session is None or getattr(s3d, "session", None) is not session:
         return None
-    return client if client.max_seq >= 3 and 1 in client.models else None
+    on = session.backend_of
+    return session if on(_names["keypoint"]) != "cpu" and on(name) != "cpu" else None
 
 
 def _chunks(xs, k):
     return [xs[i:i + k] for i in range(0, len(xs), k)]
 
 
-def _many(client, ft7_feeds, pairs):
+def _many(session, ft7_feeds, pairs):
     """one round trip: the 3D pairs first (requests of <= 2), then the keypoint crops (requests of
     <= 3). The service runs each request's host work inside the DSP wait of its neighbour when it
     fits, so only the first prepare and the last finish are exposed. Ending on a cheap keypoint
@@ -133,10 +158,9 @@ def _many(client, ft7_feeds, pairs):
     two-hand frame vs 19.5 one request at a time (Frame, cores 5-6, 2026-11-21)."""
     import numpy as np
     from handtrack.inference import OUTPUTS, SHAPES
-    reqs = [(1, c) for c in _chunks(pairs, 2)] + [(0, c) for c in _chunks(ft7_feeds, 3)]
-    if len(reqs) > client.max_seq:
-        raise ValueError("frame needs %d requests" % len(reqs))
-    res = client.infer_many(reqs)
+    kp_name, s3d_name = _names["keypoint"], _names["stereo3d"]
+    reqs = [(s3d_name, c) for c in _chunks(pairs, 2)] + [(kp_name, c) for c in _chunks(ft7_feeds, 3)]
+    res = session.infer_many(reqs)
     flat = [o for r in res for o in r]
     j3, kp = flat[:len(pairs)], flat[len(pairs):]
     if len(kp) != len(ft7_feeds) or len(j3) != len(pairs):
@@ -149,7 +173,7 @@ def _many(client, ft7_feeds, pairs):
     for o in j3:
         if np.asarray(o["joints3d"]).size != 63 or not np.isfinite(o["joints3d"]).all():
             raise ValueError("FrameNPU returned invalid joints3d")
-    return kp, j3, client.last_timing or {}
+    return kp, j3, session.last_timing or {}
 
 
 def run_stereo3d(jobs, imgs, raw=False):
@@ -174,20 +198,18 @@ def run_stereo3d(jobs, imgs, raw=False):
         if len(valid) == len(views):
             pair = stereo3d.feeds(preps[views[0]], preps[views[1]], jcs[views[0]], right, R10, t10)
         hands.append((side, jcs, right, use_hint, preps, valid, pair))
-    client = None if _many_off else _many_client(mk, s3d)
-    if client is not None and any(h[5] for h in hands):
+    session = None if _many_off else _many_session(mk, s3d)
+    if session is not None and any(h[5] for h in hands):
         s0, t0, td = _schedstat(), time.monotonic_ns(), time.perf_counter()
         try:
-            kp, j3, timing = _many(client, [h[4][sl][-1] for h in hands for sl in h[5]],
+            kp, j3, timing = _many(session, [h[4][sl][-1] for h in hands for sl in h[5]],
                                    [h[6][0] for h in hands if h[6] is not None])
         except Exception as exc:
-            # a failed frame latches both models to the CPU (never retried on the NPU)
-            LOG.warning("NPU frame request failed; tracking continues on the CPU: %s", exc)
+            # (the session latches its own fallback; this is a malformed answer) per hand from here on
+            LOG.warning("NPU frame request failed; tracking continues per hand: %s", exc)
             _many_off = True
-            if hasattr(mk.backend, "_disable") and mk.backend.accelerator is not None:
-                mk.backend._disable(exc)
-            s3d.client, s3d.name = None, "cpu"
         else:
+            kp_on, s3d_on = mk.backend.name, s3d.name
             dsec, t1, s1 = time.perf_counter() - td, time.monotonic_ns(), _schedstat()
             reqs = timing.get("requests") or [{}]
             out, ik, ij = [], 0, 0
@@ -206,7 +228,7 @@ def run_stereo3d(jobs, imgs, raw=False):
                 out.append((side, res, J3, p3, views[0], dsec,
                             {"t0": t0, "t1": t1, "cpu_ns": (s1[0] - s0[0]) if first else 0,
                              "wait_ns": (s1[1] - s0[1]) if first else 0, "hint": use_hint,
-                             "batch_crops": len(valid), "inference": "framenpu", "s3d_inference": "framenpu",
+                             "batch_crops": len(valid), "inference": kp_on, "s3d_inference": s3d_on,
                              "request_crops": len(valid), "frame_requests": len(reqs),
                              "dsp_body_ms": timing.get("body_ms", 0.0) if first else 0.0}))
             return out
@@ -235,18 +257,19 @@ _many_off = False
 
 
 # ---------------------------------------------------------------- Mercury-detector discovery
-_det = None               # ("framenpu", NPU service client) | ("cpu", onnxruntime session)
+_det = None               # ("session", (session, model name)) | ("cpu", onnxruntime session)
 _det_geo = None
 _det_model = "~/handtrack/models/mercury/grayscale_detection_160x160.onnx"
 
 
 def init_detector():
-    """The detector backend (the NPU service's model 2 when it serves it, else ONNX Runtime on one
-    thread) and the head-frame camera geometry, lazily."""
+    """The detector backend (the detector model of the keypoint model's framenpu session: the NPU
+    service when it serves it, else its CPU; or ONNX Runtime on one thread without a session) and
+    the head-frame camera geometry, lazily."""
     global _det, _det_geo
     if _det is None:
-        client = _service_client(init_mercury().backend)
-        _det = ("framenpu", client) if client is not None and 2 in client.models else _det_cpu()
+        session, name = _session_model(init_mercury(), "detector")
+        _det = ("session", (session, name)) if session is not None else _det_cpu()
     if _det_geo is None:
         from handtrack import mercdet
         from handtrack import source as camsource
@@ -262,20 +285,21 @@ def _det_cpu():
     return ("cpu", ort.InferenceSession(os.path.expanduser(_det_model), o, providers=["CPUExecutionProvider"]))
 
 
+def _det_kind():
+    """where the detector runs now (telemetry): framenpu | cpu"""
+    kind, b = _det
+    return b[0].backend_of(b[1]) if kind == "session" else kind
+
+
 def _detect(feeds):
-    """Detector outputs of the crops, in order: two crops per service request, all requests in one
-    round trip. A service failure latches the detector to the CPU (as the keypoint backend does)."""
-    global _det
+    """Detector outputs of the crops, in order: two crops per request, all requests in one round
+    trip (infer_many). A failure latches the session to its CPU (framenpu.open's fallback)."""
     (kind, b), _ = init_detector()
-    if kind == "framenpu":
-        reqs = [(2, feeds[i:i + 2]) for i in range(0, len(feeds), 2)]
-        try:
-            outs = b.infer_many(reqs) if len(reqs) > 1 else [b.infer(reqs[0][1], model=2)]
-            return [o for r in outs for o in r]
-        except Exception as exc:  # noqa: BLE001 -- any service failure: CPU from here on
-            import sys
-            print("mercury detector: NPU service failed (%s); CPU from now on" % exc, file=sys.stderr, flush=True)
-            _det = _det_cpu()
+    if kind == "session":
+        session, name = b
+        reqs = [(name, feeds[i:i + 2]) for i in range(0, len(feeds), 2)]
+        outs = session.infer_many(reqs) if len(reqs) > 1 else [session.infer(name, reqs[0][1])]
+        return [o for r in outs for o in r]
     sess = _det[1]
     names = [o.name for o in sess.get_outputs()]
     return [dict(zip(names, sess.run(None, f))) for f in feeds]
@@ -298,7 +322,8 @@ def _finish_discovery(frames, items, outs, layout, det_size, tracked, t_start):
     import numpy as np
     from handtrack import mercdet
     mk = init_mercury()
-    (kind, _), geo = init_detector()
+    _, geo = init_detector()
+    kind = _det_kind()
     answers = []
     for (sl, i, _), o in zip(items, outs):
         answers += mercdet.decode(sl, [i], [o], layout)
@@ -388,8 +413,11 @@ def _ride(mk, observations, frames, disc):
     prepared = [mk._prepare(**o) for o in observations]
     valid = [p for p in prepared if p is not None]
     det = None
-    if valid and items and hasattr(mk.backend, "infer_frame"):      # (a plain CPU backend has none)
-        kp, det = mk.backend.infer_frame([p[-1] for p in valid], (2, [f for _, _, f in items]))
+    (kind, b), _ = init_detector()
+    if valid and items and kind == "session":   # one frame request (one DSP job on a --multi image)
+        session, name = b
+        kp, det = session.infer_frame([(_names["keypoint"], [p[-1] for p in valid]),
+                                       (name, [f for _, _, f in items])])
     else:
         kp = mk.backend.infer([p[-1] for p in valid]) if valid else []
     it = iter(kp)
