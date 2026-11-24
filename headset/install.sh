@@ -1,12 +1,12 @@
 #!/bin/bash
-# Install the pinned library set (headset/PINS) from wheels: framenpu into the NPU service's root venv
-# and the tracker venv, framehands into the tracker venv. The service unit runs `framenpu serve` on
+# Install the pinned library set (headset/PINS) from wheels: framenpu and framenpu-cdsp into the NPU
+# service's root venv and the tracker venv, framehands into the tracker venv. The service unit runs `framenpu serve` on
 # the Mercury image shipped in framenpu_cdsp; the models stay root-owned copies in /var/lib/mrhand-npu/model.
 #
 #   headset/install.sh WHEEL_DIR          (as steamos; asks sudo for the service side)
 #
 # Refuses a wheel set that does not match PINS, and a result where the two venvs hold different
-# framenpu versions. Stops the tracker first (aborts if it will not stop) and checks the DSP is clean
+# library versions. Stops the tracker first (aborts if it will not stop) and checks the DSP is clean
 # before changing anything. What it replaces is kept: the service side in a root-owned
 # /var/lib/mrhand-npu/backup-libs-TAG, the tracker side in ~/handtrack/rollback/TAG, which holds
 # rollback.sh; ~/handtrack/rollback-libs.sh links the newest.
@@ -29,12 +29,13 @@ USP=/home/steamos/handtrack/venv/lib/python3.14/site-packages
 declare -A WHL
 while read -r pin; do
   name=${pin%%==*}; ver=${pin#*==}
-  found=("$WHEELS/$name-$ver-"*.whl)
+  found=("$WHEELS/${name//-/_}-$ver-"*.whl)
   [ ${#found[@]} = 1 ] && [ -f "${found[0]}" ] || { echo "no single $name-$ver wheel in $WHEELS" >&2; exit 1; }
   WHL[$name]=${found[0]}
 done < <(grep -v '^\s*#' "$SRC/headset/PINS" | grep .)
-for n in framenpu framehands; do [ -n "${WHL[$n]:-}" ] || { echo "PINS lacks $n" >&2; exit 1; }; done
+for n in framenpu framenpu-cdsp framehands; do [ -n "${WHL[$n]:-}" ] || { echo "PINS lacks $n" >&2; exit 1; }; done
 FNPU_VER=$(grep '^framenpu==' "$SRC/headset/PINS" | cut -d= -f3)
+CDSP_VER=$(grep '^framenpu-cdsp==' "$SRC/headset/PINS" | cut -d= -f3)
 FH_VER=$(grep '^framehands==' "$SRC/headset/PINS" | cut -d= -f3)
 
 # ---- stop the tracker; the DSP must be clean with nothing running
@@ -73,9 +74,9 @@ SUDO() { sudo "\$@"; }
 bash /home/steamos/handtrack/stop.sh >/dev/null 2>&1 || true
 sleep 2
 SUDO systemctl stop mrhand-npu.service
-SUDO sh -c 'rm -rf /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu_cdsp /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu-*.dist-info'
+SUDO sh -c 'rm -rf /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu_cdsp /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu-*.dist-info /var/lib/mrhand-npu/venv/lib/python3.14/site-packages/framenpu_cdsp-*.dist-info'
 SUDO cp -a $SB/sp/. $SSP/
-rm -rf /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu_cdsp /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu-*.dist-info /home/steamos/handtrack/venv/lib/python3.14/site-packages/framehands /home/steamos/handtrack/venv/lib/python3.14/site-packages/framehands-*.dist-info
+rm -rf /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu_cdsp /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu-*.dist-info /home/steamos/handtrack/venv/lib/python3.14/site-packages/framenpu_cdsp-*.dist-info /home/steamos/handtrack/venv/lib/python3.14/site-packages/framehands /home/steamos/handtrack/venv/lib/python3.14/site-packages/framehands-*.dist-info
 cp -a $RB/user-sp/. $USP/
 cp -a $RB/src/. /home/steamos/handtrack/src/
 SUDO rm -f /etc/systemd/system/mrhand-npu.service
@@ -90,25 +91,29 @@ RBS
 chmod 755 "$RB/rollback.sh"
 ln -sfn "$RB/rollback.sh" /home/steamos/handtrack/rollback-libs.sh
 
-# ---- install: service venv (framenpu, root-owned), tracker venv (framenpu + framehands); no network
+# ---- install: service venv (framenpu + framenpu-cdsp, root-owned), tracker venv (those + framehands);
+# no network. framenpu goes first and alone: one before 0.4.0 owns the framenpu_cdsp files, and
+# uninstalling it after the new framenpu-cdsp would delete them.
 SUDO systemctl stop mrhand-npu.service
 SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall "${WHL[framenpu]}"
+SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall "${WHL[framenpu-cdsp]}"
 SUDO chown -R root:root /var/lib/mrhand-npu/venv
 SUDO chmod -R go-w /var/lib/mrhand-npu/venv
+/home/steamos/handtrack/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall "${WHL[framenpu]}"
 /home/steamos/handtrack/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall \
-  "${WHL[framenpu]}" "${WHL[framehands]}"
+  "${WHL[framenpu-cdsp]}" "${WHL[framehands]}"
 # the tracker runs from ~/handtrack/src: copies there would shadow the venv packages
 rm -rf /home/steamos/handtrack/src/framenpu /home/steamos/handtrack/src/framenpu_cdsp /home/steamos/handtrack/src/framehands
 
 # ---- one version everywhere, imported from the venvs
-SV=$(/var/lib/mrhand-npu/venv/bin/python -I -c 'import framenpu, framenpu_cdsp.mercury_device; print(framenpu.__version__)')
+SV=$(/var/lib/mrhand-npu/venv/bin/python -I -c 'import framenpu, framenpu_cdsp.mercury_device; from framenpu import devices; assert devices.available() == ["cdsp"], devices.available(); print(framenpu.__version__, framenpu_cdsp.__version__)')
 UV=$(cd /home/steamos/handtrack/src && /home/steamos/handtrack/venv/bin/python -c '
-import framenpu, framehands, handtrack.mpworker
-for m in (framenpu, framehands):
+import framenpu, framenpu_cdsp, framehands, handtrack.mpworker
+for m in (framenpu, framenpu_cdsp, framehands):
     assert m.__file__.startswith("'"$USP"'"), m.__file__
-print(framenpu.__version__, framehands.__version__)')
-if [ "$SV" != "$FNPU_VER" ] || [ "$UV" != "$FNPU_VER $FH_VER" ]; then
-  echo "mixed set: service $SV, tracker $UV (pins $FNPU_VER $FH_VER); roll back with bash $RB/rollback.sh" >&2
+print(framenpu.__version__, framenpu_cdsp.__version__, framehands.__version__)')
+if [ "$SV" != "$FNPU_VER $CDSP_VER" ] || [ "$UV" != "$FNPU_VER $CDSP_VER $FH_VER" ]; then
+  echo "mixed set: service $SV, tracker $UV (pins $FNPU_VER $CDSP_VER $FH_VER); roll back with bash $RB/rollback.sh" >&2
   exit 1
 fi
 
@@ -145,7 +150,7 @@ for k, v in sorted(c.manifests.items()):
     print(" model", k, v["name"], (v["weights_sha256"] or "")[:8], "max_crops", v["max_crops"])
 assert c.manifests and all(v["name"] for v in c.manifests.values()), "a served model has no manifest"
 c.close()'
-echo "$(date -Is) installed libraries framenpu $SV + framehands $FH_VER from wheels ($(sha256sum "${WHL[framenpu]}" "${WHL[framehands]}" | cut -c1-12 | tr '\n' ' ')); unit runs framenpu serve on the bundled image; rollback $RB/rollback.sh" \
+echo "$(date -Is) installed libraries framenpu + framenpu-cdsp $SV + framehands $FH_VER from wheels ($(sha256sum "${WHL[framenpu]}" "${WHL[framenpu-cdsp]}" "${WHL[framehands]}" | cut -c1-12 | tr '\n' ' ')); unit runs framenpu serve on the bundled image; rollback $RB/rollback.sh" \
   >> /home/steamos/handtrack/CHANGES.log
 bash /home/steamos/handtrack/start.sh
 echo "installed; rollback: bash $RB/rollback.sh"
