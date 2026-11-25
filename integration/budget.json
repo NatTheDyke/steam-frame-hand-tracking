@@ -1,0 +1,17 @@
+{
+ "note": "Limits from 114 two-hand windows of three live sessions on 2026-11-24 (framenpu 0.4.2, framenpu-cdsp 0.1.2, framehands 0.2.6, AXI clock off): session medians 103.9/102.3/109.5 frames/s, request 9.0/9.1/9.3 ms, latency p50 22/23/21 and p95 27/28/26 ms, loop 4.3/4.3/4.0 ms; service CPU 1.18-1.34 ms/crop in 45 s windows the same day. About 10% above what was measured (service CPU 20%: fewest samples). Change a limit only with a measurement, and say which.",
+ "min_crops_per_window": 200,
+ "min_windows": 4,
+ "watch_only": ["service CPU ms/crop"],
+ "limits": {
+  "bad log lines": {"max": 0},
+  "frames/s": {"min": 93},
+  "request ms (median window)": {"max": 10.2},
+  "latency p50 ms": {"max": 25},
+  "latency p95 ms": {"max": 31},
+  "loop ms/frame": {"max": 4.8},
+  "rejected share": {"max": 0.08},
+  "max C": {"max": 92},
+  "service CPU ms/crop": {"max": 1.6}
+ }
+}

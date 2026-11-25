@@ -1,0 +1,109 @@
+# The four repositories together (integration/README.md). The tracker runs it on its own changes and
+# every night; framenpu, framenpu-cdsp and framehands call it with their commit as the candidate.
+name: Integration
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      framenpu: {type: string, default: main}
+      framenpu-cdsp: {type: string, default: main}
+      framehands: {type: string, default: main}
+  workflow_call:
+    inputs:
+      framenpu: {type: string, default: main}
+      framenpu-cdsp: {type: string, default: main}
+      framehands: {type: string, default: main}
+
+permissions:
+  contents: read
+
+env:
+  # the tracker commit under test: this one, or main when another repository calls
+  TRACKER: ${{ github.repository == 'NatTheDyke/steam-frame-hand-tracking' && github.sha || 'main' }}
+  FRAMENPU: ${{ inputs.framenpu || 'main' }}
+  FRAMENPU_CDSP: ${{ inputs.framenpu-cdsp || 'main' }}
+  FRAMEHANDS: ${{ inputs.framehands || 'main' }}
+
+jobs:
+  # What is released together (headset/PINS) and what would be released next must each work; and the
+  # root service and the tracker install separately, so each must work with the other's old version.
+  together:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # aarch64, as the headset: the native host kernels only run there
+          - {name: candidate on aarch64, os: ubuntu-24.04-arm, tracker: candidate, service: candidate}
+          - {name: released, os: ubuntu-24.04, tracker: released, service: released}
+          - {name: candidate, os: ubuntu-24.04, tracker: candidate, service: candidate}
+          - {name: candidate tracker on released service, os: ubuntu-24.04, tracker: candidate, service: released}
+          - {name: released tracker on candidate service, os: ubuntu-24.04, tracker: released, service: candidate}
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NatTheDyke/steam-frame-hand-tracking
+          ref: ${{ env.TRACKER }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: models
+          key: integration-models-${{ hashFiles('headset/PINS') }}
+      - name: Install the released and the candidate libraries
+        run: |
+          python integration/setup_env.py released --models models
+          python integration/setup_env.py candidate --models models \
+            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS"
+      - name: Tests
+        env:
+          TRACKER_SET: ${{ matrix.tracker }}
+          SERVICE_SET: ${{ matrix.service }}
+        run: |
+          set -a; . "$SERVICE_SET/env"; set +a
+          FI_SERVICE_PYTHON="$PWD/$SERVICE_SET/venv/bin/python" FI_REQUIRED=1 \
+            "$TRACKER_SET/venv/bin/python" -m unittest discover -s integration -v
+
+  # CPU cost of the candidate against the release, paired on one machine. aarch64 runs the native host
+  # kernels the headset runs.
+  performance:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NatTheDyke/steam-frame-hand-tracking
+          ref: ${{ env.TRACKER }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: models
+          key: integration-models-${{ hashFiles('headset/PINS') }}
+      - name: Install the released and the candidate libraries
+        run: |
+          python integration/setup_env.py released --models models
+          python integration/setup_env.py candidate --models models \
+            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS"
+      - name: Compare
+        run: |
+          set -a; . candidate/env; set +a
+          set -o pipefail
+          candidate/venv/bin/python integration/perf.py compare --base released/venv/bin/python \
+            --base-cdsp-tests released/src/framenpu-cdsp/tests --json perf.json | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: performance
+          path: perf.json
+          if-no-files-found: ignore
