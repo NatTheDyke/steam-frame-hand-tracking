@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 env:
-  # the library set of headset/PINS (framenpu 0.4.0, framenpu-cdsp 0.1.0, framehands 0.2.3), by commit
+  # the library set of headset/PINS (framenpu 0.4.0, framenpu-cdsp 0.1.1, framehands 0.2.3), by commit
   FRAMENPU: git+https://github.com/NatTheDyke/framenpu@a8f344ed7fca57ce890ad90276e36d1bde31ebbe
-  FRAMENPU_CDSP: git+https://github.com/NatTheDyke/framenpu-cdsp@80ba356fd3c9d55fbf74b46621cd0b0865686060
+  FRAMENPU_CDSP: git+https://github.com/NatTheDyke/framenpu-cdsp@53ea92fe5cb5348b24c6127e74458d1100b39849
   FRAMEHANDS: git+https://github.com/NatTheDyke/framehands@89a8a76cbc597f0fb09b53958b63aee13fdd20be
   # Mercury's keypoint model from Monado's model repository (no published license: not re-hosted)
   MERCURY_URL: https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models/-/raw/37a8a81bc8f433ac6cbdf2471909d2bac74beca1/grayscale_keypoint_jan18.onnx
@@ -30,7 +30,7 @@ jobs:
       - name: Check the workflow pins match headset/PINS
         run: |
           grep -qx 'framenpu==0.4.0' headset/PINS
-          grep -qx 'framenpu-cdsp==0.1.0' headset/PINS
+          grep -qx 'framenpu-cdsp==0.1.1' headset/PINS
           grep -qx 'framehands==0.2.3' headset/PINS
       - name: Install the pinned libraries
         run: python -m pip install "framenpu[cpu] @ $FRAMENPU" "framenpu-cdsp @ $FRAMENPU_CDSP" "framehands @ $FRAMEHANDS"
