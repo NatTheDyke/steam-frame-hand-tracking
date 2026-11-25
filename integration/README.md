@@ -13,7 +13,7 @@ set -a; . /tmp/cand/env; set +a
 | --- | --- |
 | The libraries' versions, entry points, plugin ABI and the PC driver's packet agree | `test_versions.py` |
 | `handtrack.live` end to end: synthetic cameras of two hands at known places, the real service, the bridge as the driver reads it. Position, orientation, curls, hint, mirroring, crops per frame and per request, restarts, a second client, a DSP fault, a killed service | `test_closed_loop.py` (`world.py`, `stack.py`) |
-| `framenpu serve` and its client on framenpu-cdsp's lane simulator with the real weights, bit for bit; framehands' batching on it | `test_device.py` |
+| `framenpu serve` and its client on framenpu-cdsp's lane simulator with the real weights, bit for bit (aarch64's native kernels: to 1e-5 where framenpu-cdsp's tests allow it); framehands' batching on it | `test_device.py` |
 | CPU cost of one set of libraries against another, paired on one machine | `perf.py` |
 | The running tracker on the headset against `budget.json` (read-only) | `headset.py` |
 

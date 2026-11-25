@@ -5,6 +5,7 @@ real weights: `framenpu serve` as installed, and framenpu.open's three backends 
 import getpass
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,9 @@ import numpy as np
 D, T = os.environ.get("FI_MODELS"), os.environ.get("FI_CDSP_TESTS")
 KP, DET = (str(Path(D or "") / n) for n in ("student_ft7.onnx", "grayscale_detection_160x160.onnx"))
 NAMES = ("mercury-ft7", "mercury-detector-160")
+# The aarch64 native host kernels sum some heads in another order than NumPy; framenpu-cdsp's
+# tests/test_native_host.py holds them to 1e-5, and these outputs to equality.
+NATIVE, EXACT = platform.machine() == "aarch64", ("heatmap_xy", "scalar_extras", "curls")
 WHY = "FI_MODELS and FI_CDSP_TESTS not set" if not (D and T) else None
 
 
@@ -80,7 +84,11 @@ class DeviceThroughTheService(unittest.TestCase):
             for feed, out in zip(crops, outs):
                 want = mercury.run(g, feed, "fp16")
                 for k in out:
-                    np.testing.assert_array_equal(out[k], want[k], err_msg="%s %s" % (name, k))
+                    msg = "%s %s" % (name, k)
+                    if NATIVE and k not in EXACT:
+                        np.testing.assert_allclose(out[k], want[k], rtol=0, atol=1e-5, err_msg=msg)
+                    else:
+                        np.testing.assert_array_equal(out[k], want[k], err_msg=msg)
         for n in (1, 4):
             check(NAMES[0], kp[:n], s.infer(NAMES[0], kp[:n]))
         check(NAMES[1], det, s.infer(NAMES[1], det))
