@@ -20,7 +20,7 @@ MOVED = {
                    "merctrack", "mercury_kp", "palm", "source", "stereo3d"},
     "framenpu": {"inference": "backends", "npuservice": "service"},
 }
-APP = {"__init__", "live", "mpworker", "uclamp", "watchdog"}
+APP = {"__init__", "apiloop", "live", "mpworker", "uclamp", "watchdog"}
 
 
 def moved():

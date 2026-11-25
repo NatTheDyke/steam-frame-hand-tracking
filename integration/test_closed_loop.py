@@ -16,6 +16,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stack  # noqa: E402
 
+try:                                                    # --loop api needs a HandTracker with an engine option
+    import inspect
+    from framehands import HandTracker
+    API = "engine" in inspect.signature(HandTracker).parameters
+except ImportError:
+    API = False
+
 D = os.environ.get("FI_MODELS")
 MODELS = [Path(D or "") / n for n in ("student_ft7.onnx", "grayscale_detection_160x160.onnx")]
 WHY = ("FI_MODELS not set" if not D else next(("%s missing" % m for m in MODELS if not m.is_file()), None)) or stack.blocked()
@@ -38,8 +45,13 @@ if WHY and os.environ.get("FI_REQUIRED"):              # CI: a skip would look l
 
 @unittest.skipIf(WHY, WHY)
 class ClosedLoop(unittest.TestCase):
+    loop = "classic"
+
+    def stack(self, **kw):
+        return stack.Stack(MODELS, args=("--loop", self.loop), **kw)
+
     def up(self, **kw):
-        s = stack.Stack(MODELS, **kw)
+        s = self.stack(**kw)
         s.__enter__()
         self.addCleanup(s.__exit__)
         self.assertTrue(s.wait(s.tracked, 40), "no hands tracked\n" + s.log("live")[-3000:] + s.log("serve")[-1000:])
@@ -93,7 +105,7 @@ class ClosedLoop(unittest.TestCase):
         """With two hands the tracker can sort their sides out by position; alone, the detector's side
         and the crop's mirroring have to be right."""
         for side, other in (("left", "right"), ("right", "left")):
-            with self.subTest(side), stack.Stack(MODELS, env={"FI_HAND": side}) as s:
+            with self.subTest(side), self.stack(env={"FI_HAND": side}) as s:
                 self.assertTrue(s.wait(lambda: s.tracked(30, (side,)), 30), s.log("live")[-2000:])
                 self.assertFalse(s.tracked(1, (other,)), "the other hand was reported")
 
@@ -155,6 +167,13 @@ class ClosedLoop(unittest.TestCase):
         self.assert_accurate(s, n)
         self.assertGreater(len(s.requests()), r)
         self.assertNotIn("using CPU", s.log("live"))
+
+
+@unittest.skipIf(WHY, WHY)
+@unittest.skipUnless(API, "this framehands' HandTracker has no engine option")
+class ClosedLoopApi(ClosedLoop):
+    """The same, with the tracking loop on framehands.HandTracker (live.py --loop api)."""
+    loop = "api"
 
 
 if __name__ == "__main__":

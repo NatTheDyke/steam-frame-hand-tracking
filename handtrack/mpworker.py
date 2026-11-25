@@ -391,6 +391,12 @@ def run_discover(frames, det_size, ncrop=2, tracked=None):
     return _finish_discovery(frames, items, outs, lay, det_size, tracked, td)
 
 
+def discover(det_size, ncrop, imgs, tracked):
+    """run_discover in the argument order of framehands.HandTracker's engine (functools.partial binds
+    the first two)."""
+    return run_discover(imgs, det_size, ncrop, tracked)
+
+
 def idle_mercury():
     if _merc is not None:
         _merc.idle()

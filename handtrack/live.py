@@ -446,6 +446,9 @@ def main():
     ap.add_argument("--telemetry", default=os.path.expanduser("~/handtrack/data/telemetry.csv"),
                     help="per-frame telemetry CSV (rotated at 20 MB); '' disables")
     ap.add_argument("--log", help="append per-frame results as JSON lines")
+    ap.add_argument("--loop", choices=("classic", "api"), default="classic",
+                    help="the tracking loop: classic (this file's own) or api (framehands.HandTracker, apiloop.py; "
+                         "needs a framehands with HandTracker's engine option and the Mercury worker setup)")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (0 = run forever)")
     a = ap.parse_args()
     if a.merc_inference == "framenpu" and not a.framenpu_jobs:
@@ -463,6 +466,11 @@ def main():
         ap.error("--discover mercury requires --backend mercury")
     if a.discover == "mercury" and a.mercury_shadow:
         ap.error("--mercury-shadow compares against MediaPipe discovery")
+    if a.loop == "api":
+        from handtrack import apiloop
+        bad = apiloop.unsupported(a)
+        if bad:
+            ap.error("--loop api does not support: " + " ".join(bad))
     import handtrack.fasttrack as _ft
     _ft.MAX_SPEED = a.max_speed
     _ft.LK["maxLevel"] = a.lk_levels
@@ -522,12 +530,14 @@ def main():
                                         initializer=mpworker.init_mercury_proc,
                                         initargs=(a.merc_inference, a.framenpu_jobs, a.npu_socket, a.merc_model,
                                                   a.merc_s3d_model, a.merc_cell_offset, a.det_model))
-        mt = MercuryTracker(palm, merc_pool, mpworker)
+        ring = None
         if a.frame_ring:
             import atexit
             from handtrack.framering import FrameRing
-            mt.ring = FrameRing((shm.h, shm.w))
-            atexit.register(mt.ring.close)
+            ring = FrameRing((shm.h, shm.w))
+            atexit.register(ring.close)
+        mt = MercuryTracker(palm, merc_pool, mpworker)
+        mt.ring = ring
         mt.curl_source = a.curl_source
         mt.sched = a.merc_sched
         mt.predict_roi = a.merc_predict_roi
@@ -1233,7 +1243,13 @@ def main():
                         y -= 26
                 viewer.publish(img)
 
-    threads = [threading.Thread(target=coordinator, daemon=True)]
+    api = None
+    if a.loop == "api":
+        mt = None                  # HandTracker has its own
+        api = apiloop.ApiLoop(a, rig=palm.rig, src=src, shm=shm, bridge=bridge, tel=tel, thermal=thermal, pool=merc_pool,
+                              ring=ring, profile=Profile(), hands_cfg=EnabledHands(), stats=lambda: stats, lock=lock,
+                              stop=stop, fingers=[FINGERS.index(f) for f in a.curl_geo_fingers.split(",") if f])
+    threads = [threading.Thread(target=coordinator if api is None else api.run, daemon=True)]
     for t in threads:
         t.start()
     t0 = tstat = time.monotonic()
@@ -1269,6 +1285,8 @@ def main():
                               ms["stereo"], ms["mono"], ms["rejected"], ms.get("collapses", 0), ms.get("seed_blocked", 0),
                               sorted(mt.tracked())), file=sys.stderr, flush=True)
                     mt.stats = {"runs": 0, "accepted": 0, "rejected": 0, "stereo": 0, "mono": 0, "ms": []}
+                if api is not None:
+                    print(api.report(dt), file=sys.stderr, flush=True)
                 if st["merc_ms"]:
                     print("   mercury shadow: %d inferences, %.1f ms median | is_hand>=0.97 %.0f%% | vs MediaPipe: 2D median "
                           "%s px, 3D median %s cm" % (len(st["merc_ms"]), np.median(st["merc_ms"]),
