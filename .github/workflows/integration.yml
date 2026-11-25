@@ -60,9 +60,11 @@ jobs:
           key: integration-models-${{ hashFiles('headset/PINS') }}
       - name: Install the released and the candidate libraries
         run: |
+          set -o pipefail
           python integration/setup_env.py released --models models
           python integration/setup_env.py candidate --models models \
-            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS"
+            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS" | tee candidate.txt
+          echo "::notice title=Candidate::tracker $(git rev-parse HEAD); $(grep -- '->' candidate.txt | tr -s ' ' | paste -sd ';')"
       - name: Tests
         env:
           TRACKER_SET: ${{ matrix.tracker }}
@@ -97,9 +99,11 @@ jobs:
           key: integration-models-${{ hashFiles('headset/PINS') }}
       - name: Install the released and the candidate libraries
         run: |
+          set -o pipefail
           python integration/setup_env.py released --models models
           python integration/setup_env.py candidate --models models \
-            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS"
+            --framenpu "$FRAMENPU" --framenpu-cdsp "$FRAMENPU_CDSP" --framehands "$FRAMEHANDS" | tee candidate.txt
+          echo "::notice title=Candidate::tracker $(git rev-parse HEAD); $(grep -- '->' candidate.txt | tr -s ' ' | paste -sd ';')"
       - name: Compare
         run: |
           set -a; . candidate/env; set +a
