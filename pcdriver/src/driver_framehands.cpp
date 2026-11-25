@@ -157,7 +157,7 @@ struct Config {
     double stillSeconds = 0.8, stillCm = 2.0, stillDeg = 6.0, handAwayCm = 10;
     double pickupCm = 4.0, pickupDeg = 15.0;
     bool forceHandMode = false;
-    std::string headsetHost = "192.168.8.180";
+    std::string headsetHost = "127.0.0.1";
     int port = FH_PORT;
     double statsSeconds = 10;
 };

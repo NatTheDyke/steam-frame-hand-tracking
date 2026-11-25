@@ -1,7 +1,7 @@
 {
 	"driver_framehands": {
 		"enable": true,
-		"headsetHost": "192.168.8.180",
+		"headsetHost": "127.0.0.1",
 		"port": 47811,
 		"stillSeconds": 2.0,
 		"forceHandMode": false,

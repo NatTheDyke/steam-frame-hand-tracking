@@ -51,12 +51,12 @@ positions in both cameras, against 351/400 for passthrough).
   buffers are allocated in pairs, right camera first. The reader refuses a layout it does not
   recognise rather than guessing.
 
-## Optional FrameNPU inference
+## FrameNPU inference
 
-Mercury tracking can use a pluggable FrameNPU inference backend with automatic
-CPU fallback. CPU remains the default. Available crops are submitted immediately
+Mercury tracking uses a pluggable FrameNPU inference backend with automatic
+CPU fallback; `setup.sh --cpu` leaves it out. Available crops are submitted immediately
 in groups of one to three; the worker never waits for a third crop.
-On the headset it runs through a small root service (`sudo headset/install_npu_service.sh`), so
+On the headset it runs through a small root service (`headset/setup.sh` installs it), so
 the tracker itself stays a normal user process; `headset/start_args` selects it with
 `--merc-inference service` and falls back to CPU when the service is not installed.
 Setup, selection and validation: [docs/FRAMENPU.md](docs/FRAMENPU.md).
@@ -120,18 +120,42 @@ Keys and measurements: [LATENCY_REPORT_V2.md](LATENCY_REPORT_V2.md).
 
 ## Install
 
-### Headset (in `~/handtrack`, source in `~/handtrack/src` = this repo)
+You need: a Steam Frame with SSH enabled, on the same network as the PC, and a sudo password for
+`steamos` (set one with `passwd`). The camera reader knows the buffer layout of SteamVR 2.19.2 on the
+headset and refuses a layout it does not recognise.
+
+### Headset
 
 ```
-# Python venv with mediapipe, opencv-python, numpy, onnxruntime in ~/handtrack/venv
-tools/fetch_models.sh                                  # models are downloaded, not in the repo
-capture/build.sh && capture/install.sh                 # build camera-sharing Vulkan layer + ptgrab + slamgrab, install the layer
-sudo setcap cap_sys_ptrace+p capture/build/slamgrab    # tracking-camera source (games); see above
-touch ~/.config/mrhand/enable-capture
-systemctl --user restart steamvr                       # compositor loads the layer
-cp headset/*.sh headset/start_args ~/handtrack/        # start.sh / stop.sh
-overlay/install_overlay.sh                             # the Hand Tracking dashboard panel
+git clone https://github.com/NatTheDyke/steam-frame-hand-tracking ~/handtrack/src
+~/handtrack/src/headset/setup.sh
 ```
+
+`setup.sh` checks before it changes anything, then builds the Python environment, the pinned libraries
+([framenpu](https://github.com/NatTheDyke/framenpu),
+[framenpu-cdsp](https://github.com/NatTheDyke/framenpu-cdsp),
+[framehands](https://github.com/NatTheDyke/framehands), versions in [headset/PINS](headset/PINS)) and
+the camera reader, and fetches the models by hash. The first run tells you how to make a two-second
+SteamVR tracking recording, the only place your headset's own camera calibration can be read from.
+
+Then start and stop tracking with `~/handtrack/start.sh` and `~/handtrack/stop.sh`, or add the
+dashboard panel with `~/handtrack/src/overlay/install_overlay.sh`.
+
+The models run on the Frame's DSP through a small root service, which takes most of the inference off the
+CPU. It is experimental: it uses undocumented DSP access and shares the DSP with Valve's own tracking.
+It works on one firmware only (SteamOS 0.5.8, CDSP ABI 9); on any other, setup uses the CPU by itself.
+During development a fault left the DSP needing a headset reboot several times; the likely cause is fixed in
+framenpu-cdsp 0.1.1. **`setup.sh --cpu`** leaves the DSP alone and runs the models on the CPU, which runs
+hotter. `sudo headset/uninstall_npu_service.sh` removes the service. Details:
+[docs/FRAMENPU.md](docs/FRAMENPU.md).
+
+### PC (Linux SteamVR)
+
+```
+pcdriver/install.sh HEADSET_IP              # needs g++; close SteamVR first
+```
+
+Proton games use the native Linux SteamVR, so they see the hands too.
 
 ### PC (Windows, VS 2022 Build Tools)
 
@@ -143,15 +167,22 @@ vrpathreg adddriver <repo>\pcdriver\framehands
 Set `headsetHost` in `pcdriver\framehands\framehands_live.ini` to the Frame's IP, then restart
 SteamVR. The driver DLL can only be replaced while PC SteamVR is closed.
 
-### PC (Linux SteamVR)
+### Updating
 
-```
-pcdriver/build.sh                                      # g++; framehands/bin/linux64/driver_framehands.so
-~/.local/share/Steam/steamapps/common/SteamVR/bin/vrpathreg.sh adddriver <repo>/pcdriver/framehands
-```
+On the headset: `~/handtrack/stop.sh`, `git -C ~/handtrack/src pull`, then `setup.sh` again.
+With the NPU service installed it then prints the `headset/install.sh` command that updates the
+service to the same versions and keeps a rollback. Your `start_args` and `profile` are kept.
 
-Same settings file and `headsetHost`; restart SteamVR after building. Proton games use the native
-Linux SteamVR, so they see the hands too.
+### Passthrough cameras (optional)
+
+The default source is the tracking cameras, which also work in games. The passthrough source
+(`--source passthrough`) needs the Vulkan layer: `capture/build.sh && capture/install.sh`,
+`touch ~/.config/mrhand/enable-capture`, `systemctl --user restart steamvr`.
+
+### Model licenses
+
+The weights are not in this repository and are not MIT: the `mercury-ft7` student is CC BY-NC-SA 4.0,
+and Mercury's own models come from Monado's repository, which publishes no license.
 
 ### Removing it
 

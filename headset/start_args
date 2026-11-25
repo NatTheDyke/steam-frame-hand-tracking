@@ -1,1 +1,1 @@
---backend mercury --merc-early --flow-v2 --source slam --blend-ms 0 --merc-inference service
+--backend mercury --merc-early --flow-v2 --source slam --blend-ms 0 --merc-inference service --splay --curl-geo-fingers index --discover mercury --det-resample linear --merc-cadence capture --frame-ring --merc-preflow --merc-crops 4

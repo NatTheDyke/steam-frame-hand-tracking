@@ -4,6 +4,8 @@
 # the Mercury image shipped in framenpu_cdsp; the models stay root-owned copies in /var/lib/mrhand-npu/model.
 #
 #   headset/install.sh WHEEL_DIR          (as steamos; asks sudo for the service side)
+#   headset/install.sh --first WHEEL_DIR  no service yet: creates its venv and model folder, and leaves
+#                                         the tracker stopped (headset/setup.sh calls this)
 #
 # Refuses a wheel set that does not match PINS, and a result where the two venvs hold different
 # library versions. Stops the tracker first (aborts if it will not stop) and checks the DSP is clean
@@ -15,9 +17,23 @@
 set -euo pipefail
 [ "$(id -un)" = steamos ] || { echo "run as steamos" >&2; exit 1; }
 SRC=$(cd "$(dirname "$0")/.." && pwd)
+FIRST=
+[ "${1:-}" = --first ] && { FIRST=1; shift; }
 WHEELS=$(cd "${1:?usage: $0 WHEEL_DIR}" && pwd)
 SUDO() { sudo "$@"; }
 [ -n "${SUDO_PASS:-}" ] && SUDO() { echo "$SUDO_PASS" | sudo -S -p "" "$@"; }
+if [ -n "$FIRST" ]; then
+  [ ! -e /var/lib/mrhand-npu ] || { echo "/var/lib/mrhand-npu exists: not a first install" >&2; exit 1; }
+  M=/home/steamos/handtrack/models/mercury
+  for m in student_ft7 grayscale_detection_160x160; do
+    [ -f "$M/$m.onnx" ] || { echo "missing $M/$m.onnx (headset/setup.sh fetches it)" >&2; exit 1; }
+  done
+  # root-owned: no user-writable file is ever executed or loaded as root
+  SUDO install -d -m 755 -o root -g root /var/lib/mrhand-npu /var/lib/mrhand-npu/model
+  SUDO /usr/bin/python3 -m venv /var/lib/mrhand-npu/venv
+  SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-cache-dir numpy
+  SUDO install -m 644 -o root -g root "$M/student_ft7.onnx" "$M/grayscale_detection_160x160.onnx" /var/lib/mrhand-npu/model/
+fi
 /var/lib/mrhand-npu/venv/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 14)' \
   || { echo "service venv is not python3.14" >&2; exit 1; }
 /home/steamos/handtrack/venv/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 14)' \
@@ -42,6 +58,9 @@ FH_VER=$(grep '^framehands==' "$SRC/headset/PINS" | cut -d= -f3)
 bash /home/steamos/handtrack/stop.sh >/dev/null 2>&1 || true
 sleep 2
 if pgrep -u steamos -f "python -m handtrack[.]live" >/dev/null; then echo "tracker did not stop: abort" >&2; exit 1; fi
+if [ -n "$FIRST" ]; then  # the check itself needs the libraries; nothing runs on the DSP yet
+  SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-deps --no-index "${WHL[framenpu]}" "${WHL[framenpu-cdsp]}"
+fi
 SUDO /var/lib/mrhand-npu/venv/bin/python -I -c '
 try:
     from framenpu_cdsp.transport import Transport
@@ -49,7 +68,7 @@ except ImportError:  # a service venv from before the split
     from framenpu.transport import Transport
 t = Transport(); s = t.status(); t.close(); print("dsp", s)
 raise SystemExit(0 if s["control"] == [1, 0, 1] and s["callback"] == 0 and not s["poisoned"] else 1)' \
-  || { echo "DSP not clean: abort (tracker left stopped)" >&2; exit 1; }
+  || { echo "DSP not clean, or this firmware is not supported: abort (tracker left stopped)" >&2; exit 1; }
 
 # ---- keep what this replaces (fresh folders)
 TAG=$(date +%Y%m%d-%H%M%S)
@@ -61,6 +80,7 @@ cp -a "$USP"/framenpu* "$USP"/framehands* "$RB/user-sp/" 2>/dev/null || true
 for p in framenpu framenpu_cdsp framehands; do
   if [ -e "/home/steamos/handtrack/src/$p" ]; then cp -a "/home/steamos/handtrack/src/$p" "$RB/src/"; fi
 done
+if [ -z "$FIRST" ]; then
 SUDO mkdir "$SB" "$SB/sp" "$SB/unit"
 SUDO sh -c "cp -a $SSP/framenpu* $SB/sp/; cp -a /etc/systemd/system/mrhand-npu.service $SB/unit/; \
   if [ -d /etc/systemd/system/mrhand-npu.service.d ]; then cp -a /etc/systemd/system/mrhand-npu.service.d $SB/unit/; fi"
@@ -90,11 +110,12 @@ echo "rolled back $TAG"
 RBS
 chmod 755 "$RB/rollback.sh"
 ln -sfn "$RB/rollback.sh" /home/steamos/handtrack/rollback-libs.sh
+fi
 
 # ---- install: service venv (framenpu + framenpu-cdsp, root-owned), tracker venv (those + framehands);
 # no network. framenpu goes first and alone: one before 0.4.0 owns the framenpu_cdsp files, and
 # uninstalling it after the new framenpu-cdsp would delete them.
-SUDO systemctl stop mrhand-npu.service
+[ -n "$FIRST" ] || SUDO systemctl stop mrhand-npu.service
 SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall "${WHL[framenpu]}"
 SUDO /var/lib/mrhand-npu/venv/bin/python -m pip install --quiet --no-deps --no-index --force-reinstall "${WHL[framenpu-cdsp]}"
 SUDO chown -R root:root /var/lib/mrhand-npu/venv
@@ -141,6 +162,7 @@ UNIT
 SUDO install -m 644 -o root -g root "$RB/mrhand-npu.service" /etc/systemd/system/mrhand-npu.service
 SUDO rm -rf /etc/systemd/system/mrhand-npu.service.d
 SUDO systemctl daemon-reload
+if [ -n "$FIRST" ]; then SUDO systemctl enable --quiet mrhand-npu.service; fi
 SUDO systemctl start mrhand-npu.service
 for _ in $(seq 30); do [ -S /run/mrhand-npu/npu.sock ] && break; sleep 0.5; done
 /home/steamos/handtrack/venv/bin/python -I -c '
@@ -152,5 +174,9 @@ assert c.manifests and all(v["name"] for v in c.manifests.values()), "a served m
 c.close()'
 echo "$(date -Is) installed libraries framenpu + framenpu-cdsp $SV + framehands $FH_VER from wheels ($(sha256sum "${WHL[framenpu]}" "${WHL[framenpu-cdsp]}" "${WHL[framehands]}" | cut -c1-12 | tr '\n' ' ')); unit runs framenpu serve on the bundled image; rollback $RB/rollback.sh" \
   >> /home/steamos/handtrack/CHANGES.log
+if [ -n "$FIRST" ]; then
+  echo "NPU service installed; remove it with: sudo headset/uninstall_npu_service.sh"
+  exit 0
+fi
 bash /home/steamos/handtrack/start.sh
 echo "installed; rollback: bash $RB/rollback.sh"

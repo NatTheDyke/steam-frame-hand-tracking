@@ -50,7 +50,6 @@ cv2.setNumThreads(1)
 
 from handtrack import source as camsource
 from handtrack.calib import triangulate
-from handtrack.detect import HandDetector, draw
 from handtrack.fasttrack import FastTracker, plausible
 from handtrack.mercsched import Admission, FrameGrid, capture_cap_due, rate_cap_due
 from handtrack.palm import PALM_IDX, Bridge, OneEuro, PalmTracker
@@ -342,11 +341,11 @@ def main():
                     help="mercury: MediaPipe only discovers hands; Mercury keypoints track them continuously")
     ap.add_argument("--merc-inference", choices=("cpu", "framenpu", "service"), default="cpu",
                     help="Mercury inference (default CPU). framenpu: FrameNPU in this process (root); "
-                         "service: FrameNPU through the NPU service (headset/install_npu_service.sh), the "
+                         "service: FrameNPU through the NPU service (headset/setup.sh), the "
                          "tracker runs as the user. FrameNPU failures fall back to CPU")
     ap.add_argument("--merc-model", help="a retrained Mercury keypoint ONNX (same graph) instead of "
                     "grayscale_keypoint_jan18.onnx, for CPU inference; for the NPU service install the "
-                    "service with MERC_MODEL=... (headset/install_npu_service.sh)")
+                    "NPU service (headset/setup.sh)")
     ap.add_argument("--merc-cell-offset", type=float, default=0.5,
                     help="heatmap cell-centre convention of the keypoint model: 0.5 = Monado's Mercury (default); "
                          "0 = the distilled students (ft3/ft7/...), wherever they run (CPU or NPU service)")
@@ -1214,6 +1213,7 @@ def main():
                 tiles = []
                 for c in (1, 0):   # left camera on the left
                     hs = shown[c]
+                    from handtrack.detect import draw   # needs MediaPipe: only for this view
                     t = draw(imgs[c], hs)          # newest image, last MediaPipe skeleton
                     for side, ht in fast.hands.items():
                         ct = ht.cams.get(c)

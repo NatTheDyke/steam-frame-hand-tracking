@@ -3,33 +3,19 @@
 Mercury tracking keeps its existing crop geometry, normalization, hint policy,
 heatmap decoder, handedness, camera assignment, discovery, optical flow and hand
 fit. Inference is selected independently with `--merc-inference cpu|framenpu`.
-CPU is the default and still uses the same ONNX Runtime session settings.
+`handtrack.live` defaults to the CPU (`headset/start_args`, which setup installs, selects the NPU service); it uses the same ONNX Runtime session settings.
 
 The optional FrameNPU backend runs `Conv_0..Conv_139` on the Frame's DSP using
 the qualified 55-descriptor replay image. Hint projection, pooling and heads
 remain on the CPU. Short live-camera trials alongside Valve tracking confirm
 inference-worker CPU savings and a modest two-crop processing-time gain.
 Sustained thermal/coexistence qualification and PC-rendering latency remain
-unmeasured; CPU stays the default.
+unmeasured.
 
 ## Install and select
 
-Install FrameNPU in the tracker's Python environment (the version with
-`framenpu.mercury_runtime.MercurySession`) and build its qualified image in the
-FrameNPU source checkout:
-
-```sh
-python tools/build_teacher_link.py --stride2 --s2-even --s2-direct --pw-fast \
-  --dw-fast --pw-group 8 --replay --output /tmp/mercury-jobs
-```
-
-Deploy `link.json`, `teacher_link.bin` and `teacher_link_loader.fjob` together
-into, for example, `~/handtrack/framenpu-jobs`. The linked image SHA256 is
-`d7a78a81469c10acaf193b0d99cc0415f92d1de845a7a9aa292a7a1ebe691819`;
-the loader code SHA256 is
-`72280ad93eb4ffcf49e7de26908fa2d8f9056e0d9e1e8618f75eba867a7ba3f0`.
-FrameNPU verifies both and the existing Mercury model hash before use. Weights
-are still fetched privately via the existing model setup; none are bundled.
+`headset/setup.sh` installs everything: the pinned libraries, the models and the NPU service.
+The DSP image ships in framenpu-cdsp, which checks its hash and the firmware before use.
 
 CPU, including on machines with no FrameNPU installation:
 
@@ -57,12 +43,12 @@ separate process must not contend for the same DSP session.
 
 Running the whole tracker as root breaks the panel, the start/stop scripts and the thermal
 watchdog (they cannot see or stop a root process), and runs user-writable code as root. Instead,
-`handtrack/npuservice.py` runs as a small root systemd service that owns the FrameNPU session, and
+`framenpu serve` runs as a small root systemd service that owns the FrameNPU session, and
 the tracker stays an ordinary user process:
 
 ```sh
-sudo headset/install_npu_service.sh /path/to/framenpu-0.1.0-py3-none-any.whl [~/handtrack/framenpu-jobs]
-echo "... --merc-inference service" > ~/handtrack/start_args   # see headset/start_args
+headset/setup.sh              # first install
+headset/install.sh WHEEL_DIR        # later updates, with a rollback
 ```
 
 - Everything the service runs or reads is a root-owned copy in `/var/lib/mrhand-npu`: its own
