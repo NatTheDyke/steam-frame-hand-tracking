@@ -68,9 +68,14 @@ jobs:
           TRACKER_SET: ${{ matrix.tracker }}
           SERVICE_SET: ${{ matrix.service }}
         run: |
+          set -o pipefail
           set -a; . "$SERVICE_SET/env"; set +a
           FI_SERVICE_PYTHON="$PWD/$SERVICE_SET/venv/bin/python" FI_REQUIRED=1 \
-            "$TRACKER_SET/venv/bin/python" -m unittest discover -s integration -v
+            "$TRACKER_SET/venv/bin/python" -m unittest discover -s integration -v 2>&1 | tee test.log || {
+            # failures also become annotations, which are readable without signing in to GitHub
+            awk '/^(FAIL|ERROR): /{t=$0; n=0} /^[A-Za-z.]*(Error|Exception)(:|$)/{n=12} n-->0{m=m $0 "%0A"; if(!n||/^$/){print "::error title=" t "::" m; m="";n=0}} END{if(m) print "::error title=" t "::" m}' test.log
+            exit 1
+          }
 
   # CPU cost of the candidate against the release, paired on one machine. aarch64 runs the native host
   # kernels the headset runs.
