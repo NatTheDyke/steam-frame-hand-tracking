@@ -343,12 +343,13 @@ def main():
                     help="Mercury inference (default CPU). framenpu: FrameNPU in this process (root); "
                          "service: FrameNPU through the NPU service (headset/setup.sh), the "
                          "tracker runs as the user. FrameNPU failures fall back to CPU")
-    ap.add_argument("--merc-model", help="a retrained Mercury keypoint ONNX (same graph) instead of "
-                    "grayscale_keypoint_jan18.onnx, for CPU inference; for the NPU service install the "
+    ap.add_argument("--merc-model", help="a Mercury keypoint ONNX of the same graph (retrained, or Monado's "
+                    "grayscale_keypoint_jan18.onnx) instead of student_ft7.onnx, for CPU inference; for the NPU service install the "
                     "NPU service (headset/setup.sh)")
-    ap.add_argument("--merc-cell-offset", type=float, default=0.5,
-                    help="heatmap cell-centre convention of the keypoint model: 0.5 = Monado's Mercury (default); "
-                         "0 = the distilled students (ft3/ft7/...), wherever they run (CPU or NPU service)")
+    ap.add_argument("--merc-cell-offset", type=float, default=None,
+                    help="heatmap cell-centre convention of the keypoint model, over what its manifest states "
+                         "(default): 0 = the distilled students (ft7), 0.5 = Monado's Mercury (jan18). The wrong "
+                         "one shifts hands ~5 cm in depth")
     ap.add_argument("--npu-socket", help="NPU service socket (default /run/mrhand-npu/npu.sock)")
     ap.add_argument("--framenpu-jobs", type=os.path.expanduser,
                     help="qualified FrameNPU replay build directory (link.json, image and loader)")

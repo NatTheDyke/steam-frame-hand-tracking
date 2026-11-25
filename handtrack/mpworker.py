@@ -6,6 +6,8 @@ worker process owns one HandLandmarker per camera; the main process sends it
 640x640 gray frames and gets back plain Hand records.
 """
 import os
+import sys
+
 
 def cpus_from_env():
     """CPU cores for our workload: HANDTRACK_CPUS like "0-2" or "0,1,2" (default 0-6, never the prime core 7)."""
@@ -39,7 +41,7 @@ def init(gpu=False, mirrored=True):
 
 _merc = None
 _merc_config = {}
-_merc_model = "~/handtrack/models/mercury/grayscale_keypoint_jan18.onnx"
+_merc_model = "~/handtrack/models/mercury/student_ft7.onnx"   # what the NPU service runs, so its CPU fallback matches
 
 
 def _open_session(inference="cpu", framenpu_jobs=None, npu_socket=None):
@@ -64,6 +66,11 @@ def _open_session(inference="cpu", framenpu_jobs=None, npu_socket=None):
 _names = {}               # kind -> the session's model name (keypoint, detector, stereo3d)
 
 
+def cell_offset(session, model):
+    """The heatmap cell convention the model's manifest states (0 for ft7, 0.5 for Monado's jan18)."""
+    return float(session.entries[model].manifest.decode["heatmap_cell_offset"])
+
+
 def init_mercury():
     """Lazily load Monado Mercury's keypoint model (license UNVERIFIED: local measurement only)."""
     global _merc, _names
@@ -75,6 +82,10 @@ def init_mercury():
         cfg = dict(_merc_config)
         session, _names = _open_session(cfg.pop("inference", "cpu"), cfg.pop("framenpu_jobs", None),
                                         cfg.pop("npu_socket", None))
+        if cfg.get("cell_offset") is None:
+            cfg["cell_offset"] = cell_offset(session, _names["keypoint"])
+        print("mercury keypoint model: %s, heatmap cell offset %g" % (_names["keypoint"], cfg["cell_offset"]),
+              file=sys.stderr, flush=True)
         _merc = MercuryKeypoint(os.path.expanduser(_merc_model), Rig(), src.slot_cams, 640, source=src,
                                 session=session, model=_names["keypoint"], **cfg)
     return _merc
@@ -88,7 +99,7 @@ def _session_model(mk, kind):
 
 
 def init_mercury_proc(inference="cpu", framenpu_jobs=None, npu_socket=None, model=None, s3d_model=None,
-                      cell_offset=0.5, det_model=None):
+                      cell_offset=None, det_model=None):
     """Initializer for the dedicated Mercury worker process (no MediaPipe in it). det_model: Mercury's
     hand detector for --discover mercury (run_discover), used on the CPU when the NPU service does
     not serve it."""

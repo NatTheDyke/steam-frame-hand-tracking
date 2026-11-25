@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 import numpy as np
@@ -149,6 +150,44 @@ class StereoFrameTests(unittest.TestCase):
             mpworker._names.clear()
             mpworker._names.update(old[3])
             session.close()
+
+
+class CellOffsetTests(unittest.TestCase):
+    """the worker decodes with the convention its model's manifest states"""
+
+    def session(self, name):
+        m = S.bundled_manifests()[name]
+        entry = types.SimpleNamespace(manifest=m, name=m.name)
+        return types.SimpleNamespace(entries={m.name: entry}, models=(m.name,))
+
+    def test_the_manifest_decides(self):
+        from handtrack import mpworker
+        self.assertEqual(mpworker.cell_offset(self.session("mercury-ft7"), "mercury-ft7"), 0.0)
+        self.assertEqual(mpworker.cell_offset(self.session("mercury-keypoint-jan18"), "mercury-keypoint-jan18"), 0.5)
+
+    def made_with(self, **config):
+        """the cell_offset MercuryKeypoint is made with"""
+        from unittest import mock
+        from handtrack import mpworker
+        got = {}
+
+        def keypoint(*a, cell_offset=None, **kw):
+            got["cell_offset"] = cell_offset
+        with mock.patch.object(mpworker, "_merc", None), mock.patch.object(mpworker, "_merc_config", config), \
+                mock.patch.object(mpworker, "_names", {}), mock.patch.object(mpworker, "_open_session",
+                    lambda *a: (self.session("mercury-ft7"), {"keypoint": "mercury-ft7"})), \
+                mock.patch("handtrack.mercury_kp.MercuryKeypoint", keypoint), mock.patch("handtrack.calib.Rig", object):
+            mpworker.init_mercury()
+        return got["cell_offset"]
+
+    def test_the_option_overrides_it(self):
+        self.assertEqual(self.made_with(), 0.0)
+        self.assertEqual(self.made_with(cell_offset=None), 0.0)
+        self.assertEqual(self.made_with(cell_offset=0.5), 0.5)
+
+    def test_the_fallback_model_is_the_one_the_service_runs(self):
+        from handtrack import mpworker
+        self.assertTrue(mpworker._merc_model.endswith("/student_ft7.onnx"))
 
 
 if __name__ == "__main__":
