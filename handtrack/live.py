@@ -995,7 +995,8 @@ def main():
                 if mt is not None:
                     for sd_, p_ in poses_d.items():
                         if p_ is not None:
-                            mt.seed(sd_, p_[3], t_det / 1e9)
+                            if mt.seed(sd_, p_[3], t_det / 1e9) == "takeover":
+                                fast.hands.pop(sd_, None)          # it followed the old track
                 for side, p in poses_d.items():
                     if p is None:
                         continue
