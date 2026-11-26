@@ -50,7 +50,10 @@ def unsupported(a):
             raise ImportError
     except ImportError:
         return ["(the installed framehands: it needs HandTracker with an engine option)"]
-    return ["--" + k.replace("_", "-") for k, ok in _SUPPORTED if getattr(a, k) not in ok]
+    out = ["--" + k.replace("_", "-") for k, ok in _SUPPORTED if getattr(a, k) not in ok]
+    if a.merc_presence > 0 and "presence" not in inspect.signature(HandTracker).parameters:
+        out.append("--merc-presence (the installed framehands: it needs HandTracker with a presence option)")
+    return out
 
 
 def smoothing(pv, rot_smooth_ms):
@@ -69,7 +72,8 @@ class ApiLoop:
         self.tracker = HandTracker(
             rig, engine=WorkerEngine(a.size, a.det_crops), executor=pool, ring=ring, source=src.name,
             keypoint_hz=a.merc_hz, detect_hz=a.max_hz, idle_detect_hz=a.idle_hz, redetect_hz=a.discover_hz,
-            views=a.merc_views, max_crops=a.merc_crops, curl_joint_fingers=tuple(fingers), preflow=a.merc_preflow, events=True)
+            views=a.merc_views, max_crops=a.merc_crops, curl_joint_fingers=tuple(fingers), preflow=a.merc_preflow, events=True,
+            **({"presence": a.merc_presence} if a.merc_presence > 0 else {}))
         self.enabled = None
         self.off_ns = 0
         self.last = None                # (poses, t_cap ns, ages) of the newest packet
@@ -165,6 +169,8 @@ class ApiLoop:
                 self.tel.write("K,%d,%s,%d" % (int(v[0] * 1e9), v[1], v[2]))
             elif kind == "collapse":
                 self.tel.write("C,%d,%s" % (self.last[1] if self.last else 0, v[0]))
+            elif kind == "absent":
+                self.tel.write("A,%d,%s" % (self.last[1] if self.last else 0, v[0]))
             elif kind == "identity":
                 self.tel.write("I,%d,%s" % (int(v[0] * 1e9), v[1]))
             elif kind == "discovery":

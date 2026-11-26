@@ -94,7 +94,7 @@ def args(**kw):
              merc_predict_roi=False, merc_stereo_ms=40.0, curl_latest=False, merc_hint_reset=False, flow_agree=False,
              fast_orient=False, flow_v2=True, blend_ms=0.0, merc_fresh=False, mercury_shadow=False, size=640, max_speed=4.0,
              merc_cadence="capture", no_http=True, log=None, merc_hz=30.0, max_hz=7.0, idle_hz=5.0, discover_hz=2.0,
-             merc_crops=4, merc_preflow=True, rot_smooth_ms=40.0, merc_stereo_comp="on", merc_early=True, det_crops=2)
+             merc_crops=4, merc_preflow=True, rot_smooth_ms=40.0, merc_stereo_comp="on", merc_early=True, det_crops=2, merc_presence=0.0)
     d.update(kw)
     return types.SimpleNamespace(**d)
 
@@ -183,8 +183,16 @@ class ApiLoopTests(unittest.TestCase):
                          ((1.0, 2.0), 25.0, "both", False, 3_000_000))
         self.assertTrue(self.tel[-1].startswith("P,"))
 
+    def test_a_dropped_phantom_is_logged(self):
+        loop = self.make()
+        loop.last = (None, 123, None)
+        self.tr.ev = [("absent", "right")]
+        loop.events()
+        self.assertEqual(self.tel[-1], "A,123,right")
+
     def test_unsupported_options_are_named(self):
         self.assertEqual(apiloop.unsupported(args()), [])
+        self.assertEqual(apiloop.unsupported(args(merc_presence=0.1)), [])
         self.assertEqual(apiloop.unsupported(args(flow_agree=True, no_http=False)), ["--flow-agree", "--no-http"])
 
 

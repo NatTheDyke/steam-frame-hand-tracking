@@ -388,6 +388,9 @@ def main():
                     help="send finger splay (sideways spread) computed from the 3D joints (default: 0); older PC drivers ignore it")
     ap.add_argument("--curl-latest", action="store_true",
                     help="finger curls from the newest observation only (no blend with older views of other cameras)")
+    ap.add_argument("--merc-presence", type=float, default=0.0,
+                    help="drop a hand after a few Mercury crops in a row whose mean heatmap peak is below this "
+                         "(the crop does not fit a hand: a phantom track); 0 = off, 0.10 on the recordings")
     ap.add_argument("--merc-hint-reset", action="store_true",
                     help="no keypoint hint for Mercury crops placed after a rejected observation or lost flow")
     ap.add_argument("--flow-v2", action="store_true",
@@ -549,6 +552,10 @@ def main():
         mt.curl_latest = a.curl_latest
         mt.curl_geo = [FINGERS.index(f) for f in a.curl_geo_fingers.split(",") if f]
         mt.hint_reset = a.merc_hint_reset
+        if a.merc_presence > 0:
+            if not hasattr(mt, "presence"):
+                sys.exit("--merc-presence needs a framehands with MercuryTracker.presence")
+            mt.presence = a.merc_presence
         print("mercury: stereo<=%.0f ms, views=%s, motion comp=%s, curls=%s%s, hint reset=%s, roi predict=%s, sched=%s" % (
             mt.stereo_ms, mt.views, mt.stereo_comp, "latest" if mt.curl_latest else "blend",
             (" (single-view joints: %s)" % a.curl_geo_fingers) if mt.curl_geo else "", mt.hint_reset,
@@ -762,6 +769,16 @@ def main():
                     next_det = 0.0
                     if tel is not None:
                         tel.write("C,%d,%s" % (t_cap, mt.collapsed))
+                for sd_ in getattr(mt, "absent", ()):
+                    # its crops stopped fitting a hand (--merc-presence): forget it and look again now
+                    fast.hands.pop(sd_, None)
+                    slow.pop(sd_, None)
+                    slow_cam_q[sd_].clear()
+                    next_det = 0.0
+                    if tel is not None:
+                        tel.write("A,%d,%s" % (t_cap, sd_))
+                if getattr(mt, "absent", None):
+                    mt.absent = []
 
         def anchors(fp):
             """v2: Mercury anchors single-view depth only to a two-camera position, never to a held
